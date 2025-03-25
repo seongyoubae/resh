@@ -1,5 +1,5 @@
 import argparse
-import vessl
+
 
 def get_cfg():
     parser = argparse.ArgumentParser(description="Steel Plate Selection RL Hyperparameters")
@@ -15,7 +15,7 @@ def get_cfg():
     parser.add_argument("--num_critic_layers", type=int, default=2, help="Number of layers in the critic network")
     parser.add_argument("--temp_lr", type=float, default=0.01, help="Learning rate for temperature parameter")
     parser.add_argument("--target_entropy", type=float, default=2.0, help="Target entropy for automatic temperature adjustment")
-    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.00001, help="Learning rate")
     parser.add_argument("--lr_decay", type=float, default=0.9, help="Learning rate decay factor")
     parser.add_argument("--lr_step", type=int, default=2000, help="Step interval for learning rate decay")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
@@ -28,7 +28,7 @@ def get_cfg():
     parser.add_argument("--n_epoch", type=int, default=1000000, help="Total number of epochs")
     parser.add_argument("--P_coeff", type=float, default=1.0, help="Coefficient for policy loss")
     parser.add_argument("--V_coeff", type=float, default=0.5, help="Coefficient for value loss")
-    parser.add_argument("--E_coeff", type=float, default=0.01, help="Coefficient for entropy loss")
+    parser.add_argument("--E_coeff", type=float, default=0.05, help="Coefficient for entropy loss")
     parser.add_argument("--eval_every", type=int, default=500, help="Evaluate every x episodes")
     parser.add_argument("--save_every", type=int, default=500, help="Save model every x episodes")
     parser.add_argument("--save_final_state_every", type=int, default=10000, help="Save final state every x episodes")
@@ -67,16 +67,8 @@ def get_cfg():
     parser.add_argument("--critic_init_std", type=float, default=1.0, help="Standard deviation for critic head initialization")
     parser.add_argument("--activation", type=str, default="elu", help="Activation function to use (e.g., elu, relu)")
 
-    # 타깃 critic 업데이트 관련
+    # 타깃 critic 업데이트 관련 (추가)
     parser.add_argument("--update_target_interval", type=int, default=100, help="Interval (in minibatches) for updating target critic network")
     parser.add_argument("--tau", type=float, default=0.01, help="Soft update coefficient for target critic network")
 
-    args = parser.parse_args()
-
-    # Vessl Web UI에서 설정한 값이 있으면 덮어쓰기 (모든 인자에 대해 자동 적용)
-    for key, value in vars(args).items():
-        setattr(args, key, vessl.get_param(key, value))
-
-    return args
-
-
+    return parser.parse_args()
