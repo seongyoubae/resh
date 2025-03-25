@@ -404,13 +404,12 @@ def main():
             print(f"[Eval] AvgReward={avg_eval:.2f}, AvgReversal={avg_eval_reversal:.2f}")
 
             #vessl log에 들어가는 코드
-            vessl.log(
-                step=epoch,
-                payload={
-                    'Evaluation Reward': avg_eval,
-                    'Evaluation Reversal': avg_eval_reversal
-                }
-            )
+
+            vessl.log(step=epoch, payload={
+                'evaluation_reward': avg_eval,
+                'evaluation_reversal': avg_eval_reversal
+            })
+
             # CSV 로깅
             # 평가 후 로그 저장 부분에서
             eval_log_file = getattr(cfg, "evaluation_log_file", "evaluation_log.csv")
@@ -523,7 +522,7 @@ def main():
 
         # vessl에 올라갈 손실 값 로깅 추가
         vessl.log(
-            step=global_step,
+            step=epoch,
             payload={
                 'Training Reward': avg_epoch_reward,
                 'Training Reversal': avg_reversal,
