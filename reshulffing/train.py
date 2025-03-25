@@ -12,6 +12,7 @@ from data import Plate, generate_schedule, generate_reshuffle_plan, save_reshuff
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
+import vessl
 
 # network.py에서 가져오는 모델 및 패딩 상수
 from network import SteelPlateConditionalMLPModel, pad_input_state, MAX_SOURCE, MAX_DEST
@@ -288,10 +289,10 @@ def main():
             if all(dones):
                 break
 
-        # print reward/reversal
-        for i in range(episodes_per_epoch):
-            print(f"  Env {i} finished with Reward={ep_rewards[i]:.2f}, "
-                  f"Reversal={envs[i].last_reversal}, Steps={ep_steps[i]}")
+        # print reward/reversal 디버깅 구문 삭제
+        # for i in range(episodes_per_epoch):
+        #     print(f"  Env {i} finished with Reward={ep_rewards[i]:.2f}, "
+        #           f"Reversal={envs[i].last_reversal}, Steps={ep_steps[i]}")
 
         # GAE & data_buffer
         for i in range(episodes_per_epoch):
@@ -402,6 +403,14 @@ def main():
             print("----- Evaluation End -----")
             print(f"[Eval] AvgReward={avg_eval:.2f}, AvgReversal={avg_eval_reversal:.2f}")
 
+            #vessl log에 들어가는 코드
+            vessl.log(
+                step=epoch,
+                payload={
+                    'Evaluation Reward': avg_eval,
+                    'Evaluation Reversal': avg_eval_reversal
+                }
+            )
             # CSV 로깅
             # 평가 후 로그 저장 부분에서
             eval_log_file = getattr(cfg, "evaluation_log_file", "evaluation_log.csv")
@@ -512,11 +521,26 @@ def main():
                 N
             ])
 
+        # vessl에 올라갈 손실 값 로깅 추가
+        vessl.log(
+            step=global_step,
+            payload={
+                'Training Reward': avg_epoch_reward,
+                'Training Reversal': avg_reversal,
+                'Total Loss': avg_loss,
+                'Actor Loss': avg_actor_loss,
+                'Critic Loss': avg_critic_loss,
+                'Entropy Loss': avg_entropy_loss
+            }
+        )
+
         lr_sched.step()
 
         if epoch%cfg.save_every==0 and epoch>0:
+            save_dir = "/output/model/"
+            os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(cfg.save_model_dir, f"model_epoch{epoch}.pth")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            save_path = os.path.join(save_dir, f"model_epoch{epoch}.pth")
             torch.save(model.state_dict(), save_path)
             print(f"모델 저장: {save_path}")
 
