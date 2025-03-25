@@ -1,5 +1,5 @@
 import argparse
-
+import vessl
 
 def get_cfg():
     parser = argparse.ArgumentParser(description="Steel Plate Selection RL Hyperparameters")
@@ -67,8 +67,16 @@ def get_cfg():
     parser.add_argument("--critic_init_std", type=float, default=1.0, help="Standard deviation for critic head initialization")
     parser.add_argument("--activation", type=str, default="elu", help="Activation function to use (e.g., elu, relu)")
 
-    # 타깃 critic 업데이트 관련 (추가)
+    # 타깃 critic 업데이트 관련
     parser.add_argument("--update_target_interval", type=int, default=100, help="Interval (in minibatches) for updating target critic network")
     parser.add_argument("--tau", type=float, default=0.01, help="Soft update coefficient for target critic network")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Vessl Web UI에서 설정한 값이 있으면 덮어쓰기 (모든 인자에 대해 자동 적용)
+    for key, value in vars(args).items():
+        setattr(args, key, vessl.get_param(key, value))
+
+    return args
+
+
