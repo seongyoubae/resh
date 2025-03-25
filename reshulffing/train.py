@@ -403,12 +403,18 @@ def main():
             print("----- Evaluation End -----")
             print(f"[Eval] AvgReward={avg_eval:.2f}, AvgReversal={avg_eval_reversal:.2f}")
 
-            #vessl log에 들어가는 코드
+            # 평가 후 로그 기록 (평가 시)
+            avg_eval = float(avg_eval) if avg_eval is not None and not np.isnan(avg_eval) else 0.0
+            avg_eval_reversal = float(avg_eval_reversal) if avg_eval_reversal is not None and not np.isnan(
+                avg_eval_reversal) else 0.0
 
-            vessl.log(step=epoch, payload={
-                'evaluation_reward': avg_eval,
-                'evaluation_reversal': avg_eval_reversal
-            })
+            vessl.log(
+                step=int(epoch),
+                payload={
+                    'evaluation_reward': avg_eval,
+                    'evaluation_reversal': avg_eval_reversal
+                }
+            )
 
             # CSV 로깅
             # 평가 후 로그 저장 부분에서
@@ -520,16 +526,26 @@ def main():
                 N
             ])
 
-        # vessl에 올라갈 손실 값 로깅 추가
+        # Training 로깅 (손실 값 등)
+        avg_epoch_reward = float(avg_epoch_reward) if avg_epoch_reward is not None and not np.isnan(
+            avg_epoch_reward) else 0.0
+        avg_reversal = float(avg_reversal) if avg_reversal is not None and not np.isnan(avg_reversal) else 0.0
+        avg_loss = float(avg_loss) if avg_loss is not None and not np.isnan(avg_loss) else 0.0
+        avg_actor_loss = float(avg_actor_loss) if avg_actor_loss is not None and not np.isnan(avg_actor_loss) else 0.0
+        avg_critic_loss = float(avg_critic_loss) if avg_critic_loss is not None and not np.isnan(
+            avg_critic_loss) else 0.0
+        avg_entropy_loss = float(avg_entropy_loss) if avg_entropy_loss is not None and not np.isnan(
+            avg_entropy_loss) else 0.0
+
         vessl.log(
-            step=epoch,
+            step=int(epoch),
             payload={
-                'Training Reward': avg_epoch_reward,
-                'Training Reversal': avg_reversal,
-                'Total Loss': avg_loss,
-                'Actor Loss': avg_actor_loss,
-                'Critic Loss': avg_critic_loss,
-                'Entropy Loss': avg_entropy_loss
+                'training_reward': avg_epoch_reward,
+                'training_reversal': avg_reversal,
+                'total_loss': avg_loss,
+                'actor_loss': avg_actor_loss,
+                'critic_loss': avg_critic_loss,
+                'entropy_loss': avg_entropy_loss
             }
         )
 
