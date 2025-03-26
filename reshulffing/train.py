@@ -75,6 +75,21 @@ def main():
         print(f" -> Current CUDA Device: {torch.cuda.current_device()}")
         print(f" -> Device Name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
+
+    print("=== Hyperparameters ===")
+    print(f"Learning Rate: {cfg.lr}")
+    print(f"T_horizon: {cfg.T_horizon}")
+    print(f"Number of Minibatches: {cfg.num_minibatches}")
+    print(f"Episodes per Epoch: {cfg.episodes_per_epoch}")
+    print(f"K_epoch: {cfg.K_epoch}")
+    print(f"Total Epochs: {cfg.n_epoch}")
+    print(f"Policy Loss Coefficient (P_coeff): {cfg.P_coeff}")
+    print(f"Value Loss Coefficient (V_coeff): {cfg.V_coeff}")
+    print(f"Entropy Loss Coefficient (E_coeff): {cfg.E_coeff}")
+    print(f"Evaluate Every: {cfg.eval_every} episodes")
+    print(f"Save Every: {cfg.save_every} episodes")
+    print(f"Generate New Instance Every: {cfg.new_instance_every} episodes")
+    print("=======================")
     # --------------------------
     # 1) 엑셀 기반 reshuffle plan 생성 + 저장
     # --------------------------
