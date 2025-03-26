@@ -1,5 +1,5 @@
 import argparse
-
+import os
 
 def get_cfg():
     parser = argparse.ArgumentParser(description="Steel Plate Selection RL Hyperparameters")
@@ -15,7 +15,7 @@ def get_cfg():
     parser.add_argument("--num_critic_layers", type=int, default=2, help="Number of layers in the critic network")
     parser.add_argument("--temp_lr", type=float, default=0.01, help="Learning rate for temperature parameter")
     parser.add_argument("--target_entropy", type=float, default=2.0, help="Target entropy for automatic temperature adjustment")
-    parser.add_argument("--lr", type=float, default=0.00001, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--lr_decay", type=float, default=0.9, help="Learning rate decay factor")
     parser.add_argument("--lr_step", type=int, default=2000, help="Step interval for learning rate decay")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
@@ -71,4 +71,23 @@ def get_cfg():
     parser.add_argument("--update_target_interval", type=int, default=100, help="Interval (in minibatches) for updating target critic network")
     parser.add_argument("--tau", type=float, default=0.01, help="Soft update coefficient for target critic network")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Vessl Web UI에서 설정된 하이퍼파라미터로 덮어쓰기
+    for key, value in vars(args).items():
+        env_key = f"VESSEL_PARAM_{key}"
+        env_value = os.getenv(env_key)
+        if env_value is not None:
+            try:
+                if isinstance(value, bool):
+                    setattr(args, key, env_value.lower() == "true")
+                elif isinstance(value, int):
+                    setattr(args, key, int(env_value))
+                elif isinstance(value, float):
+                    setattr(args, key, float(env_value))
+                else:
+                    setattr(args, key, env_value)
+            except Exception as e:
+                print(f"[Warning] Could not convert {env_key}='{env_value}' to type {type(value)}: {e}")
+
+    return args
