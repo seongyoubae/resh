@@ -12,6 +12,7 @@ from data import Plate, generate_schedule, generate_reshuffle_plan, save_reshuff
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
+import vessl
 
 # network.py에서 가져오는 모델 및 상수들
 from network import SteelPlateConditionalMLPModel, pad_input_state_and_mask, MAX_SOURCE, MAX_DEST, PAD_INPUT_DIM
@@ -274,9 +275,9 @@ def main():
 
             if all(dones):
                 break
-
-        for i in range(episodes_per_epoch):
-            print(f"  Env {i} finished with Reward={ep_rewards[i]:.2f}, Reversal={envs[i].last_reversal}, Steps={ep_steps[i]}")
+        # 코드 복잡해서 삭제
+        # for i in range(episodes_per_epoch):
+        #     print(f"  Env {i} finished with Reward={ep_rewards[i]:.2f}, Reversal={envs[i].last_reversal}, Steps={ep_steps[i]}")
 
         for i in range(episodes_per_epoch):
             if len(ep_data[i]) > 0:
@@ -384,6 +385,12 @@ def main():
             print("----- Evaluation End -----")
             print(f"[Eval] AvgReward={avg_eval:.2f}, AvgReversal={avg_eval_reversal:.2f}")
 
+            # 베슬용 Evaluation 로그 기록
+            vessl.log({
+                "evaluation_reward": avg_eval,
+                "evaluation_reversal": avg_eval_reversal
+            }, step=epoch)
+
             eval_log_file = getattr(cfg, "evaluation_log_file", "evaluation_log.csv")
             eval_log_dir = os.path.dirname(eval_log_file)
             if eval_log_dir:
@@ -472,6 +479,16 @@ def main():
 
         crane_move_value = np.mean([env.crane_move for env in envs])
         print(f"Epoch {epoch}: Loss={avg_loss:.4f} (Actor={avg_actor_loss:.4f}, Critic={avg_critic_loss:.4f}, Entropy={avg_entropy_loss:.4f}), Crane={crane_move_value:.2f}")
+
+        # 베슬용 Training 로그 기록
+        vessl.log({
+            "training_reward": avg_epoch_reward,
+            "training_reversal": avg_reversal,
+            "total_loss": avg_loss,
+            "actor_loss": avg_actor_loss,
+            "critic_loss": avg_critic_loss,
+            "entropy_loss": avg_entropy_loss
+        }, step=epoch)
 
         with open(cfg.log_file, mode="a", newline="") as f:
             writer = csv.writer(f)
