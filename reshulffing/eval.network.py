@@ -13,6 +13,7 @@ from network import SteelPlateConditionalMLPModel
 ##########################################
 MAX_SOURCE = 30
 MAX_DEST   = 30
+PAD_INPUT_DIM = (MAX_SOURCE + MAX_DEST) * 3  # 예: 180
 
 def pad_boolean_mask_1d_to_2d(mask_1d: torch.Tensor, max_size: int) -> torch.Tensor:
     """
@@ -26,7 +27,6 @@ def pad_boolean_mask_1d_to_2d(mask_1d: torch.Tensor, max_size: int) -> torch.Ten
         mask_1d = out
     else:
         mask_1d = mask_1d[:max_size]
-    # (max_size,) -> (1, max_size)
     return mask_1d.unsqueeze(0)
 
 def load_model(model, model_path, device):
@@ -43,20 +43,26 @@ def evaluate_model(model, eval_env, device, num_eval_episodes=20):
         done = False
         ep_reward = 0.0
         while not done:
+            # state_tensor의 크기를 확인 (예: (240,))
             state_tensor = state.unsqueeze(0).to(device)
+            # input_mask_eval: state의 원래 크기 (예: (1, state_dim))로 생성
+            input_mask_eval = torch.ones((state_tensor.size(0), state_tensor.size(-1)), dtype=torch.bool, device=device)
+            # 이렇게 생성하면, 예를 들어 state_tensor가 (1,240)이면 input_mask_eval는 (1,240),
+            # pad_input_state_and_mask 함수 내부에서 둘 다 PAD_INPUT_DIM (예: 180)로 잘라내게 됩니다.
 
-            # (A) from_keys, to_keys 크기에 맞춰 마스크 생성(1D) -> (1,30) 패딩
+            # from_keys, to_keys용 마스크 생성 (기존대로)
+            source_mask_1d = torch.ones(len(eval_env.from_keys), dtype=torch.bool, device=device)
+            source_mask_2d = pad_boolean_mask_1d_to_2d(source_mask_1d, MAX_SOURCE)
+
+            dest_mask_1d = torch.ones(len(eval_env.to_keys), dtype=torch.bool, device=device)
+            dest_mask_2d = pad_boolean_mask_1d_to_2d(dest_mask_1d, MAX_DEST)
+
             with torch.no_grad():
-                source_mask_1d = torch.ones(len(eval_env.from_keys), dtype=torch.bool, device=device)
-                source_mask_2d = pad_boolean_mask_1d_to_2d(source_mask_1d, MAX_SOURCE)
-
-                dest_mask_1d = torch.ones(len(eval_env.to_keys), dtype=torch.bool, device=device)
-                dest_mask_2d = pad_boolean_mask_1d_to_2d(dest_mask_1d, MAX_DEST)
-
                 actions, _, _, _ = model.act_batch(
                     state_tensor,
-                    source_mask_2d,  # (1,30)
-                    dest_mask_2d,    # (1,30)
+                    input_mask_eval,  # (1, state_dim) → 예: (1,240), 이후 내부에서 (1,180)로 잘림
+                    source_mask_2d,   # (1, MAX_SOURCE)
+                    dest_mask_2d,     # (1, MAX_DEST)
                     greedy=True
                 )
 
@@ -97,12 +103,9 @@ if __name__ == "__main__":
         schedule = []
         for idx, row in df.iterrows():
             plate_id = row["pileno"]
-            inbound = row["inbound"] if ("inbound" in df.columns and not pd.isna(row["inbound"])) \
-                        else random.randint(cfg.inbound_min, cfg.inbound_max)
-            outbound = row["outbound"] if ("outbound" in df.columns and not pd.isna(row["outbound"])) \
-                        else inbound + random.randint(cfg.outbound_extra_min, cfg.outbound_extra_max)
-            unitw = row["unitw"] if ("unitw" in df.columns and not pd.isna(row["unitw"])) \
-                        else random.uniform(cfg.unitw_min, cfg.unitw_max)
+            inbound = row["inbound"] if ("inbound" in df.columns and not pd.isna(row["inbound"])) else random.randint(cfg.inbound_min, cfg.inbound_max)
+            outbound = row["outbound"] if ("outbound" in df.columns and not pd.isna(row["outbound"])) else inbound + random.randint(cfg.outbound_extra_min, cfg.outbound_extra_max)
+            unitw = row["unitw"] if ("unitw" in df.columns and not pd.isna(row["unitw"])) else random.uniform(cfg.unitw_min, cfg.unitw_max)
             to_pile = str(row["topile"]).strip() if ("topile" in df.columns and not pd.isna(row["topile"])) else "A01"
             p = Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
             p.from_pile = str(plate_id).strip()
@@ -134,18 +137,14 @@ if __name__ == "__main__":
     )
 
     # 모델 생성 (학습 시 사용한 구성과 동일하게)
-    # input_dim 대신 max_source, max_dest로 고정
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
-        num_actor_layers=cfg.num_actor_layers,
-        num_critic_layers=cfg.num_critic_layers,
-        max_source=MAX_SOURCE,  # 30
-        max_dest=MAX_DEST,      # 30
-        target_entropy=-math.log(1.0 / (MAX_SOURCE * MAX_DEST))
+        target_entropy=-math.log(1.0 / (MAX_SOURCE * MAX_DEST)),
+        use_temperature=True
     ).to(device)
 
     # 저장된 모델 파일 경로 (학습 때 생성했던 .pth 파일과 동일)
-    model_path = "model_epoch22000.pth"
+    model_path = "model_epoch400.pth"
     model = load_model(model, model_path, device)
 
     evaluate_model(model, eval_env, device, num_eval_episodes=50)

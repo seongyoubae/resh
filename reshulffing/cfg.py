@@ -21,18 +21,18 @@ def get_cfg():
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--lmbda", type=float, default=0.95, help="GAE parameter (lambda)")
     parser.add_argument("--eps_clip", type=float, default=0.2, help="Clipping parameter for PPO")
-    parser.add_argument("--T_horizon", type=int, default=4800, help="Number of steps to collect per update")
-    parser.add_argument("--num_minibatches", type=int, default=300, help="Number of minibatches for each update (T_horizon/num_minibatches)")
-    parser.add_argument("--episodes_per_epoch", type=int, default=32, help="Number of episodes to collect per epoch")
-    parser.add_argument("--K_epoch", type=int, default=5, help="Number of optimization epochs per update")
-    parser.add_argument("--n_epoch", type=int, default=1000000, help="Total number of epochs")
+    parser.add_argument("--T_horizon", type=int, default=3600, help="Number of steps to collect per update")
+    parser.add_argument("--num_minibatches", type=int, default=225, help="Number of minibatches for each update (T_horizon/num_minibatches)")
+    parser.add_argument("--episodes_per_epoch", type=int, default=16, help="Number of episodes to collect per epoch")
+    parser.add_argument("--K_epoch", type=int, default=3, help="Number of optimization epochs per update")
+    parser.add_argument("--n_epoch", type=int, default=500000, help="Total number of epochs")
     parser.add_argument("--P_coeff", type=float, default=1.0, help="Coefficient for policy loss")
     parser.add_argument("--V_coeff", type=float, default=0.5, help="Coefficient for value loss")
     parser.add_argument("--E_coeff", type=float, default=0.05, help="Coefficient for entropy loss")
     parser.add_argument("--eval_every", type=int, default=500, help="Evaluate every x episodes")
     parser.add_argument("--save_every", type=int, default=500, help="Save model every x episodes")
     parser.add_argument("--save_final_state_every", type=int, default=10000, help="Save final state every x episodes")
-    parser.add_argument("--new_instance_every", type=int, default=500, help="Generate new scenarios every x episodes")
+    parser.add_argument("--new_instance_every", type=int, default=1000, help="Generate new scenarios every x episodes")
 
     # 파일 및 저장 관련
     parser.add_argument("--plates_data_path", type=str, default="output/reshuffle_plan.xlsx", help="Path to the plates data Excel file")
@@ -59,7 +59,7 @@ def get_cfg():
     # 재배치 계획 관련
     parser.add_argument("--n_from_piles_reshuffle", type=int, default=15, help="Number of source piles for reshuffle")
     parser.add_argument("--n_to_piles_reshuffle", type=int, default=15, help="Number of destination piles for reshuffle")
-    parser.add_argument("--n_plates_reshuffle", type=int, default=10, help="Average number of plates to reshuffle per pile")
+    parser.add_argument("--n_plates_reshuffle", type=int, default=15, help="Average number of plates to reshuffle per pile")
     parser.add_argument("--safety_margin", type=int, default=0, help="Safety margin for reshuffle plan")
 
     # 네트워크 초기화 관련
