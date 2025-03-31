@@ -7,6 +7,7 @@ from cfg import get_cfg
 from env import Locating
 from data import Plate, generate_schedule
 from network import SteelPlateConditionalMLPModel
+import copy
 
 ##########################################
 # 1) 마스크 패딩 함수 추가 (1D -> (1, max_size))
@@ -39,6 +40,19 @@ def evaluate_model(model, eval_env, device, num_eval_episodes=20):
     total_rewards = []
     total_reversals = []
     for epi in range(num_eval_episodes):
+
+        env_schedule = copy.deepcopy(schedule)
+
+        eval_env = Locating(
+            num_pile=num_pile,
+            max_stack=cfg.max_stack,
+            inbound_plates=env_schedule,  # 고정된 schedule
+            device=cfg.device,
+            crane_penalty=cfg.crane_penalty,
+            from_keys=from_piles,
+            to_keys=allowed_piles
+        )
+
         state = eval_env.reset(shuffle_schedule=False)
         done = False
         ep_reward = 0.0
@@ -140,11 +154,15 @@ if __name__ == "__main__":
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
         target_entropy=-math.log(1.0 / (MAX_SOURCE * MAX_DEST)),
-        use_temperature=True
+        use_temperature=True,
+        num_actor_layers=cfg.num_actor_layers,
+        num_critic_layers=cfg.num_critic_layers,
+        actor_init_std=cfg.actor_init_std,  # 추가된 인자
+        critic_init_std=cfg.critic_init_std  # 추가된 인자
     ).to(device)
 
     # 저장된 모델 파일 경로 (학습 때 생성했던 .pth 파일과 동일)
-    model_path = "model_epoch400.pth"
+    model_path = "model_epoch300.pth"
     model = load_model(model, model_path, device)
 
     evaluate_model(model, eval_env, device, num_eval_episodes=50)

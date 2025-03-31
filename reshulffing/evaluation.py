@@ -103,10 +103,12 @@ def main():
     # 모델 생성 (학습 때와 동일)
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
+        target_entropy=-math.log(1.0 / (MAX_SOURCE * MAX_DEST)),
+        use_temperature=True,
         num_actor_layers=cfg.num_actor_layers,
         num_critic_layers=cfg.num_critic_layers,
-        max_source=MAX_SOURCE,
-        max_dest=MAX_DEST
+        actor_init_std=cfg.actor_init_std,  # 추가된 인자
+        critic_init_std=cfg.critic_init_std  # 추가된 인자
     ).to(device)
 
     # 체크포인트 로드

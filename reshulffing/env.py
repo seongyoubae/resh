@@ -173,7 +173,6 @@ class Locating(object):
             if not valid_source_indices or not valid_dest_indices:
                 # 더 이상 이동할 수 있는 pile이 없다면 에피소드 종료
                 done = True
-                # print("[DEBUG] No valid indices available. Terminating episode.")
                 return self._get_state(), 0.0, done, {}
 
             # (2) softmax 기반 fallback (act_batch에서 계산된 확률 분포 사용)
@@ -219,8 +218,7 @@ class Locating(object):
                 # uniform fallback
                 to_index = random.choice(valid_dest_indices)
             destination_key = self.to_keys[to_index]
-            # print("[DEBUG] fallback for full destination: chosen to_index:", to_index, "destination_key:",
-            #       destination_key)
+            # print("[DEBUG] fallback for full destination: chosen to_index:", to_index, "destination_key:", destination_key)
 
         # (4) 소스 pile이 비어 있으면 fallback
         if not self.plates.get(source_key, []):
@@ -270,12 +268,18 @@ class Locating(object):
 
         # (8) 에피소드 종료 여부 및 최종 reversal 계산
         done = self.stage >= self.total_plate_count
+        # 여기서 상태가 전부 0이면 강제 종료
+        next_state = self._get_state()
+        if next_state.abs().sum().item() < 1e-6:
+            print("[WARNING] next_state is all zeros — forcing done=True")
+            done = True
+
         if done:
             final_reversal, _ = simulate_transfer(self.move_data, self.initial_plates, self.initial_dest)
             self.last_reversal = final_reversal
             # print("[DEBUG] Episode done. Final reversal:", final_reversal)
 
-        return self._get_state(), immediate_reward, done, {}
+        return next_state, immediate_reward, done, {}
 
     # def _composite_step(self, action):
     #     from_index, to_index = action

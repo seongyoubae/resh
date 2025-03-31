@@ -12,10 +12,9 @@ from data import Plate, generate_schedule, generate_reshuffle_plan, save_reshuff
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
-import vessl
-
-# network.py에서 가져오는 모델 및 상수들
+import copy
 from network import SteelPlateConditionalMLPModel, pad_input_state_and_mask, MAX_SOURCE, MAX_DEST, PAD_INPUT_DIM
+import vessl
 
 def set_seed(seed):
     random.seed(seed)
@@ -49,13 +48,11 @@ def make_batch(data_buffer, device):
         a_logprob_lst.append([transition['logprob']])
         v_val = transition['v'] if isinstance(transition['v'], float) else transition['v'].detach().cpu().item()
         v_lst.append([v_val])
-        # source_mask는 환경에서 얻은 actor용 mask (예: (MAX_SOURCE,))
         mask = transition['source_mask'].unsqueeze(0)
         source_mask_lst.append(mask)
-        done_mask = [0.0] if transition['done'] else [1.0]
-        done_lst.append(done_mask)
-
-    s       = torch.stack(s_lst, dim=0).to(device)            # (B, PAD_INPUT_DIM) 원래 state (이미 패딩되어 있을 수 있음)
+        done = 1.0 if transition['done'] else 0.0
+        done_lst.append([done])
+    s       = torch.stack(s_lst, dim=0).to(device)
     s_prime = torch.stack(s_prime_lst, dim=0).to(device)
     a       = torch.tensor(a_lst,       dtype=torch.long,  device=device)
     r       = torch.tensor(r_lst,       dtype=torch.float, device=device)
@@ -75,21 +72,17 @@ def main():
         print(f" -> Current CUDA Device: {torch.cuda.current_device()}")
         print(f" -> Device Name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
-
+    # 하이퍼파라미터 출력
     print("=== Hyperparameters ===")
     print(f"Learning Rate: {cfg.lr}")
+    print(f"LR Step: {cfg.lr_step}, LR Decay: {cfg.lr_decay}")
+    print(f"n_epoch: {cfg.n_epoch}, episodes_per_epoch: {cfg.episodes_per_epoch}")
     print(f"T_horizon: {cfg.T_horizon}")
-    print(f"Number of Minibatches: {cfg.num_minibatches}")
-    print(f"Episodes per Epoch: {cfg.episodes_per_epoch}")
-    print(f"K_epoch: {cfg.K_epoch}")
-    print(f"Total Epochs: {cfg.n_epoch}")
-    print(f"Policy Loss Coefficient (P_coeff): {cfg.P_coeff}")
-    print(f"Value Loss Coefficient (V_coeff): {cfg.V_coeff}")
-    print(f"Entropy Loss Coefficient (E_coeff): {cfg.E_coeff}")
-    print(f"Evaluate Every: {cfg.eval_every} episodes")
-    print(f"Save Every: {cfg.save_every} episodes")
-    print(f"Generate New Instance Every: {cfg.new_instance_every} episodes")
+    print(f"Gamma: {cfg.gamma}, Lambda: {cfg.lmbda}")
+    print(f"New instance every: {cfg.new_instance_every}")
+    print(f"P_coeff: {cfg.P_coeff}, V_coeff: {cfg.V_coeff}, E_coeff: {cfg.E_coeff}")
     print("=======================")
+
     # --------------------------
     # 1) 엑셀 기반 reshuffle plan 생성 + 저장
     # --------------------------
@@ -142,13 +135,22 @@ def main():
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
         target_entropy=-math.log(1.0 / (MAX_SOURCE * MAX_DEST)),
-        use_temperature=True
+        use_temperature=True,
+        num_actor_layers=cfg.num_actor_layers,
+        num_critic_layers=cfg.num_critic_layers,
+        actor_init_std=cfg.actor_init_std,
+        critic_init_std=cfg.critic_init_std
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
-    lr_sched  = StepLR(optimizer, step_size=cfg.lr_step, gamma=cfg.lr_decay)
+    # --- 별도 actor, critic optimizer 및 scheduler 설정 ---
+    actor_params = list(model.source_head.parameters()) + list(model.cond_dest_head.parameters())
+    critic_params = list(model.critic_net.parameters())
+    actor_optimizer = optim.Adam(actor_params, lr=cfg.actor_lr)
+    critic_optimizer = optim.Adam(critic_params, lr=cfg.critic_lr)
+    actor_lr_sched = StepLR(actor_optimizer, step_size=cfg.lr_step, gamma=cfg.lr_decay)
+    critic_lr_sched = StepLR(critic_optimizer, step_size=cfg.lr_step, gamma=cfg.lr_decay)
 
-    # 로그 파일
+    # 로그 파일 생성
     if os.path.dirname(cfg.log_file):
         os.makedirs(os.path.dirname(cfg.log_file), exist_ok=True)
     with open(cfg.log_file, mode="w", newline="") as f:
@@ -169,7 +171,6 @@ def main():
     global_step = 0
 
     for epoch in range(num_epochs):
-        # 매 new_instance_every마다 새로운 시나리오 생성
         if epoch % cfg.new_instance_every == 0:
             print("새로운 시나리오 생성됨 (Epoch:", epoch, ")")
             df_plan2, _, _, _, _ = generate_reshuffle_plan(
@@ -191,7 +192,6 @@ def main():
             print("새로운 에피소드: num_pile =", num_pile)
             print("새로운 에피소드: 총 stack 갯수 =", total_stacks)
 
-        # env 여러 개 생성
         envs = []
         for _ in range(episodes_per_epoch):
             env = Locating(
@@ -205,10 +205,8 @@ def main():
             )
             envs.append(env)
 
-        # state는 env.reset() 시 반환된 tensor (이미 PAD_INPUT_DIM 크기)
         states = [env.reset(shuffle_schedule=False) for env in envs]
         states = torch.stack(states, dim=0).to(device)
-        # input_mask: 모든 위치가 유효하다고 가정 (B, PAD_INPUT_DIM)
         input_mask = torch.ones(states.shape, dtype=torch.bool, device=states.device)
 
         dones      = [False]*episodes_per_epoch
@@ -216,12 +214,11 @@ def main():
         ep_data    = [[] for _ in range(episodes_per_epoch)]
         ep_steps   = [0]*episodes_per_epoch
 
-        # Rollout (T_horizon)
         for t in range(T_horizon):
             batch_source_mask = []
             batch_dest_mask   = []
             for i, env in enumerate(envs):
-                s_mask, d_mask = env.get_masks()  # (num_source,), (num_dest,)
+                s_mask, d_mask = env.get_masks()
                 s_mask = s_mask.to(device)
                 d_mask = d_mask.to(device)
                 if s_mask.size(0) < MAX_SOURCE:
@@ -241,15 +238,13 @@ def main():
                 batch_source_mask.append(s_mask)
                 batch_dest_mask.append(d_mask)
 
-            batch_source_mask = torch.stack(batch_source_mask, dim=0) # (B, MAX_SOURCE)
-            batch_dest_mask   = torch.stack(batch_dest_mask,   dim=0) # (B, MAX_DEST)
+            batch_source_mask = torch.stack(batch_source_mask, dim=0)
+            batch_dest_mask   = torch.stack(batch_dest_mask,   dim=0)
 
-            # 모델 호출 시 input_mask (전체 1)도 함께 전달
             actions_batch, logprobs_batch, values_batch, _ = model.act_batch(
                 states, input_mask, batch_source_mask, batch_dest_mask, greedy=False
             )
 
-            # step
             for i in range(episodes_per_epoch):
                 action  = actions_batch[i]
                 logprob = logprobs_batch[i]
@@ -278,21 +273,17 @@ def main():
                     'logprob': logprob.item() if hasattr(logprob, 'item') else logprob,
                     'v': value,
                     'source_mask': batch_source_mask[i],
-                    'done': 1.0 if done else 0.0
+                    'done': done
                 }
                 ep_data[i].append(transition)
                 ep_rewards[i] += reward
                 ep_steps[i] += 1
                 dones[i] = done
                 states[i] = envs[i].reset().to(device) if done else next_state
-                # input_mask 갱신 (기본적으로 all ones)
                 input_mask[i] = torch.ones_like(states[i], dtype=torch.bool)
 
             if all(dones):
                 break
-        # 코드 복잡해서 삭제
-        # for i in range(episodes_per_epoch):
-        #     print(f"  Env {i} finished with Reward={ep_rewards[i]:.2f}, Reversal={envs[i].last_reversal}, Steps={ep_steps[i]}")
 
         for i in range(episodes_per_epoch):
             if len(ep_data[i]) > 0:
@@ -314,44 +305,39 @@ def main():
                 print(f"조기 종료(Reward diff={reward_diff:.4f})")
                 break
 
-        # 평가 로직
         if epoch % cfg.eval_every == 0:
             print("----- Evaluation Start -----")
             backup_random = random.getstate()
-            backup_numpy  = np.random.get_state()
-            backup_torch  = torch.get_rng_state()
+            backup_numpy = np.random.get_state()
+            backup_torch = torch.get_rng_state()
             set_seed(970517)
 
-            eval_envs = []
             num_eval_episodes = 20
-            for _ in range(num_eval_episodes):
-                env_eval = Locating(
-                    num_pile=num_pile,
-                    max_stack=cfg.max_stack,
-                    inbound_plates=schedule,
-                    device=device,
-                    crane_penalty=cfg.crane_penalty,
-                    from_keys=None,  # 자동 생성
-                    to_keys=None     # 자동 생성
-                )
-                eval_envs.append(env_eval)
-
-            total_rewards   = []
+            total_rewards = []
             total_reversals = []
+
             model.eval()
             if hasattr(model, "temperature_param"):
                 original_temp = model.temperature_param.data.clone()
                 model.temperature_param.data.fill_(0.0)
 
-            for epi_idx, env_eval in enumerate(eval_envs):
-                s = env_eval.reset().to(device)
+            for epi_idx in range(num_eval_episodes):
+                env_eval = Locating(
+                    num_pile=num_pile,
+                    max_stack=cfg.max_stack,
+                    inbound_plates=copy.deepcopy(schedule),
+                    device=device,
+                    crane_penalty=cfg.crane_penalty,
+                    from_keys=from_piles,
+                    to_keys=allowed_piles
+                )
+                s = env_eval.reset(shuffle_schedule=False).to(device)
                 done = False
                 ep_reward = 0.0
                 while not done:
                     s_tensor = s.unsqueeze(0)
-                    # 평가 시에도 input_mask는 all ones
                     input_mask_eval = torch.ones(s_tensor.shape, dtype=torch.bool, device=device)
-                    # source 및 dest mask (env에서 얻은 값에 대해 패딩)
+
                     s_mask_1d = torch.ones(len(env_eval.from_keys), dtype=torch.bool, device=device)
                     if s_mask_1d.size(0) < MAX_SOURCE:
                         pad_s = torch.zeros(MAX_SOURCE, dtype=torch.bool, device=device)
@@ -370,7 +356,9 @@ def main():
 
                     s_mask_2d = s_mask_1d.unsqueeze(0)
                     d_mask_2d = d_mask_1d.unsqueeze(0)
-                    actions_eval, _, _, _ = model.act_batch(s_tensor, input_mask_eval, s_mask_2d, d_mask_2d, greedy=True)
+
+                    actions_eval, _, _, _ = model.act_batch(s_tensor, input_mask_eval, s_mask_2d, d_mask_2d,
+                                                            greedy=True)
                     action_eval = actions_eval[0]
                     src_idx = action_eval[0].item()
                     dst_idx = action_eval[1].item()
@@ -379,12 +367,7 @@ def main():
                     if dst_idx >= len(env_eval.to_keys):
                         dst_idx = 0
 
-                    src_key = env_eval.from_keys[src_idx]
-                    dst_key = env_eval.to_keys[dst_idx]
-                    s_idx = env_eval.from_keys.index(src_key)
-                    d_idx = env_eval.to_keys.index(dst_key)
-
-                    s, rew, done, _ = env_eval.step((s_idx, d_idx))
+                    s, rew, done, _ = env_eval.step((src_idx, dst_idx))
                     s = s.to(device)
                     ep_reward += rew
 
@@ -392,47 +375,45 @@ def main():
                 total_rewards.append(ep_reward)
                 total_reversals.append(env_eval.last_reversal)
 
-            # if hasattr(model, "temperature_param"):
-            #     model.temperature_param.data.copy_(original_temp)
-
             avg_eval = sum(total_rewards) / len(total_rewards)
-            avg_eval_reversal = sum(total_reversals) / len(total_reversals)
             print("----- Evaluation End -----")
-            print(f"[Eval] AvgReward={avg_eval:.2f}, AvgReversal={avg_eval_reversal:.2f}")
+            print(f"[Eval] AvgReward={avg_eval:.2f}")
 
-            # 베슬용 Evaluation 로그 기록
             vessl.log({
                 "evaluation_reward": avg_eval,
-                "evaluation_reversal": avg_eval_reversal
+                "evaluation_reversal": np.mean(total_reversals)
             }, step=epoch)
 
-            eval_log_file = getattr(cfg, "evaluation_log_file", "evaluation_log.csv")
-            eval_log_dir = os.path.dirname(eval_log_file)
-            if eval_log_dir:
-                os.makedirs(eval_log_dir, exist_ok=True)
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(eval_log_file, mode="a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([timestamp, epoch, avg_eval, avg_eval_reversal])
+            if not hasattr(main, "best_eval_reward"):
+                main.best_eval_reward = -float("inf")
+            if avg_eval > main.best_eval_reward:
+                main.best_eval_reward = avg_eval
+                best_model_path = os.path.join(cfg.save_model_dir, "best_model.pth")
+                torch.save(model.state_dict(), best_model_path)
+                print(f"[Elitism] Best model updated: {best_model_path} with avg_eval: {avg_eval:.2f}")
+                best_log_file = os.path.join(cfg.save_model_dir, "best_model_log.csv")
+                header = ["Epoch", "AvgEvalReward"]
+                if not os.path.exists(best_log_file):
+                    with open(best_log_file, mode="w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(header)
+                with open(best_log_file, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([epoch, avg_eval])
 
             random.setstate(backup_random)
             np.random.set_state(backup_numpy)
             torch.set_rng_state(backup_torch)
+            model.train()
 
-        # --- PPO Update ---
         mini_data_buffer = data_buffer.copy()
         data_buffer.clear()
         N = len(mini_data_buffer)
         if N == 0:
             continue
 
-        if N < cfg.num_minibatches:
-            num_minibatches = 1
-            mini_batch_size = N
-        else:
-            num_minibatches = cfg.num_minibatches
-            mini_batch_size = N // cfg.num_minibatches
-
+        mini_batch_size = cfg.mini_batch_size
+        num_minibatches = max(1, N // mini_batch_size)
         indices = torch.randperm(N, device=device)
         total_loss = 0.0
         total_actor_loss = 0.0
@@ -447,19 +428,14 @@ def main():
                 batch_idx = indices[start:end]
                 mini_data = [mini_data_buffer[j] for j in batch_idx.cpu().tolist()]
                 mini_s, mini_a, mini_r, mini_adv, mini_s_prime, mini_a_logprob, mini_v, mini_source_mask, mini_done = make_batch(mini_data, device)
-
-                # Critic target: 새롭게 input mask (all ones) 생성 후 pad
+                mini_adv = (mini_adv - mini_adv.mean()) / (mini_adv.std() + 1e-8)
                 with torch.no_grad():
                     input_mask_prime = torch.ones(mini_s_prime.shape, dtype=torch.bool, device=mini_s_prime.device)
-                    s_prime_pad, mask_prime_pad = pad_input_state_and_mask(mini_s_prime, input_mask_prime)
-                    x_prime = torch.cat([s_prime_pad, mask_prime_pad], dim=-1)  # (B, 360)
-                    v_next = model.target_critic_net(x_prime)
-
-                td_target = mini_r + cfg.gamma * v_next * mini_done
-
+                    selected_source = mini_a[:, 0]
+                    v_next = model.forward(mini_s_prime, input_mask_prime, selected_source=selected_source)[2]
+                td_target = mini_r + cfg.gamma * v_next * (1.0 - mini_done)
                 B2 = mini_s.size(0)
                 dest_mask = torch.ones((B2, MAX_DEST), dtype=torch.bool, device=device)
-                # PPO evaluate: 여기서 input mask는 모두 1 (shape: (B2, PAD_INPUT_DIM))
                 input_mask_mini = torch.ones((B2, mini_s.shape[-1]), dtype=torch.bool, device=device)
                 new_a_logprob, new_v, dist_entropy = model.evaluate(
                     mini_s, input_mask_mini, mini_a, mini_source_mask, dest_mask
@@ -468,34 +444,34 @@ def main():
                 surr1 = ratio * mini_adv
                 surr2 = torch.clamp(ratio, 1.0 - cfg.eps_clip, 1.0 + cfg.eps_clip) * mini_adv
                 actor_loss = -cfg.P_coeff * torch.min(surr1, surr2).mean()
-                critic_loss = cfg.V_coeff * F.smooth_l1_loss(new_v, td_target)
+                value_pred_clipped = mini_v + (new_v - mini_v).clamp(-cfg.value_clip_range, cfg.value_clip_range)
+                critic_loss_unclipped = F.smooth_l1_loss(new_v, td_target, reduction="none")
+                critic_loss_clipped = F.smooth_l1_loss(value_pred_clipped, td_target, reduction="none")
+                critic_loss = cfg.V_coeff * torch.max(critic_loss_unclipped, critic_loss_clipped).mean()
                 entropy_loss = -cfg.E_coeff * dist_entropy.mean()
                 ppo_loss = actor_loss + critic_loss + entropy_loss
 
-                optimizer.zero_grad()
+                actor_optimizer.zero_grad()
+                critic_optimizer.zero_grad()
                 ppo_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+                actor_optimizer.step()
+                critic_optimizer.step()
 
                 total_loss += ppo_loss.item()
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()
                 total_entropy_loss += entropy_loss.item()
                 num_updates += 1
-
                 global_step += 1
-                if global_step % cfg.update_target_interval == 0:
-                    model.update_target_critic(cfg.tau)
 
         avg_loss = total_loss / num_updates if num_updates > 0 else 0
         avg_actor_loss = total_actor_loss / num_updates if num_updates > 0 else 0
         avg_critic_loss = total_critic_loss / num_updates if num_updates > 0 else 0
         avg_entropy_loss = total_entropy_loss / num_updates if num_updates > 0 else 0
-
         crane_move_value = np.mean([env.crane_move for env in envs])
         print(f"Epoch {epoch}: Loss={avg_loss:.4f} (Actor={avg_actor_loss:.4f}, Critic={avg_critic_loss:.4f}, Entropy={avg_entropy_loss:.4f}), Crane={crane_move_value:.2f}")
 
-        # 베슬용 Training 로그 기록
         vessl.log({
             "training_reward": avg_epoch_reward,
             "training_reversal": avg_reversal,
@@ -520,7 +496,8 @@ def main():
                 N
             ])
 
-        lr_sched.step()
+        actor_lr_sched.step()
+        critic_lr_sched.step()
 
         if epoch % cfg.save_every == 0 and epoch > 0:
             save_path = os.path.join(cfg.save_model_dir, f"model_epoch{epoch}.pth")
