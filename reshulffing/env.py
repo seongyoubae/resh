@@ -21,7 +21,7 @@ def simulate_transfer(move_data, piles_from, piles_to):
 
     for target in move_data:
         src_key, dst_key = target
-        if len(piles_to_copy[dst_key]) == max_num:
+        if len(piles_to_copy[dst_key]) > max_num:
             reversal = 9999999999
             return reversal, piles_to_copy
         plate_to_move = piles_from_copy[src_key].pop()
@@ -177,21 +177,36 @@ class Locating(object):
 
             # (2) softmax 기반 fallback (act_batch에서 계산된 확률 분포 사용)
             if hasattr(self, "last_source_probs") and hasattr(self, "last_dest_probs"):
-                # valid_source_indices에 해당하는 확률만 추출 후 재정규화
+                # valid_source_indices에 해당하는 확률만 추출
                 src_probs = self.last_source_probs[valid_source_indices]
-                src_probs = src_probs / src_probs.sum()
-                # valid_dest_indices에 해당하는 확률만 추출 후 재정규화
                 dest_probs = self.last_dest_probs[valid_dest_indices]
+
+                # 디버깅: 원래 전체 확률과 valid indices에 해당하는 확률 출력
+                # print("[DEBUG] last_source_probs:", self.last_source_probs)
+                # print("[DEBUG] valid_source_indices:", valid_source_indices)
+                # print("[DEBUG] extracted src_probs:", src_probs)
+                # print("[DEBUG] Sum of extracted src_probs:", src_probs.sum().item())
+                # print("[DEBUG] last_dest_probs:", self.last_dest_probs)
+                # print("[DEBUG] valid_dest_indices:", valid_dest_indices)
+                # print("[DEBUG] extracted dest_probs:", dest_probs)
+                # print("[DEBUG] Sum of extracted dest_probs:", dest_probs.sum().item())
+
+                # 재정규화
+                src_probs = src_probs / src_probs.sum()
                 dest_probs = dest_probs / dest_probs.sum()
+
+                # print("[DEBUG] normalized src_probs:", src_probs)
+                # print("[DEBUG] normalized dest_probs:", dest_probs)
 
                 from_index = np.random.choice(valid_source_indices, p=src_probs.cpu().numpy())
                 to_index = np.random.choice(valid_dest_indices, p=dest_probs.cpu().numpy())
-                # print("[DEBUG] fallback (softmax-based): chosen from_index:", from_index, "chosen to_index:", to_index)
+                print("[DEBUG] fallback (softmax-based): chosen from_index:", from_index, "chosen to_index:", to_index)
+
             else:
                 # softmax 확률을 가지고 있지 않으면 uniform random choice로 fallback
                 from_index = random.choice(valid_source_indices)
                 to_index = random.choice(valid_dest_indices)
-                # print("[DEBUG] fallback (uniform random): chosen from_index:", from_index, "chosen to_index:", to_index)
+                print("[DEBUG] fallback (uniform random): chosen from_index:", from_index, "chosen to_index:", to_index)
 
         # (3) 최종 선택된 pile 인덱스로 source_key / destination_key를 확인
         source_key = self.from_keys[from_index]
@@ -265,13 +280,13 @@ class Locating(object):
         self.move_data.append((source_key, destination_key))
         self.crane_move += 1
         self.stage += 1
-
+        # print(f"[DEBUG] stage: {self.stage}, total_plate_count: {self.total_plate_count}")
         # (8) 에피소드 종료 여부 및 최종 reversal 계산
         done = self.stage >= self.total_plate_count
         # 여기서 상태가 전부 0이면 강제 종료
         next_state = self._get_state()
         if next_state.abs().sum().item() < 1e-6:
-            print("[WARNING] next_state is all zeros — forcing done=True")
+            # print("[WARNING] next_state is all zeros — forcing done=True")
             done = True
 
         if done:
@@ -402,4 +417,15 @@ class Locating(object):
             [len(self.plates.get(key, [])) < self.max_stack for key in self.to_keys],
             dtype=torch.bool
         )
+
+        # # 디버깅 로그 추가
+        # print("[DEBUG][Env.get_masks()] from_keys:", self.from_keys)
+        # print("[DEBUG][Env.get_masks()] to_keys:", self.to_keys)
+        # for i, k in enumerate(self.from_keys):
+        #     print(
+        #         f"   from_keys[{i}]={k}, pile_size={len(self.plates.get(k, []))}, source_mask={source_mask[i].item()}")
+        # for j, k in enumerate(self.to_keys):
+        #     print(f"   to_keys[{j}]={k}, pile_size={len(self.plates.get(k, []))}, dest_mask={dest_mask[j].item()}")
+
         return source_mask, dest_mask
+

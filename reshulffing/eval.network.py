@@ -162,7 +162,7 @@ if __name__ == "__main__":
     ).to(device)
 
     # 저장된 모델 파일 경로 (학습 때 생성했던 .pth 파일과 동일)
-    model_path = "model_epoch300.pth"
+    model_path = "model_epoch1600.pth"
     model = load_model(model, model_path, device)
 
     evaluate_model(model, eval_env, device, num_eval_episodes=50)

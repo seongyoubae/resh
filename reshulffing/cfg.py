@@ -11,7 +11,7 @@ def get_cfg():
     parser.add_argument("--embed_dim", type=int, default=128, help="Dimension of node embeddings")
     parser.add_argument("--num_heads", type=int, default=2, help="Number of multi-head attention heads")
     parser.add_argument("--num_HGT_layers", type=int, default=2, help="Number of HGT layers")
-    parser.add_argument("--num_actor_layers", type=int, default=3, help="Number of layers in the actor network")
+    parser.add_argument("--num_actor_layers", type=int, default=2, help="Number of layers in the actor network")
     parser.add_argument("--num_critic_layers", type=int, default=2, help="Number of layers in the critic network")
     parser.add_argument("--temp_lr", type=float, default=0.01, help="Learning rate for temperature parameter")
     parser.add_argument("--target_entropy", type=float, default=2.0, help="Target entropy for automatic temperature adjustment")
@@ -23,11 +23,11 @@ def get_cfg():
     parser.add_argument("--gamma", type=float, default=0.98, help="Discount factor")
     parser.add_argument("--lmbda", type=float, default=0.95, help="GAE parameter (lambda)")
     parser.add_argument("--eps_clip", type=float, default=0.2, help="Clipping parameter for PPO")
-    parser.add_argument("--T_horizon", type=int, default=150, help="Number of steps to collect per update, step in episode")
+    parser.add_argument("--T_horizon", type=int, default=50, help="Number of steps to collect per update, step in episode")
     parser.add_argument("--episodes_per_epoch", type=int, default=64, help="Number of episodes to collect per epoch, mini batch size")
-    parser.add_argument("--mini_batch_size", type=int, default=150, help="Fixed size of minibatches per PPO update, same with T_horizon")
+    parser.add_argument("--mini_batch_size", type=int, default=50, help="Fixed size of minibatches per PPO update, same with T_horizon")
     parser.add_argument("--K_epoch", type=int, default=3, help="Number of optimization epochs per update")
-    parser.add_argument("--n_epoch", type=int, default=100000, help="Total number of epochs")
+    parser.add_argument("--n_epoch", type=int, default=5000, help="Total number of epochs")
     parser.add_argument("--P_coeff", type=float, default=1.0, help="Coefficient for policy loss")
     parser.add_argument("--V_coeff", type=float, default=0.5, help="Coefficient for value loss")
     parser.add_argument("--E_coeff", type=float, default=0.01, help="Coefficient for entropy loss")
@@ -60,9 +60,9 @@ def get_cfg():
     parser.add_argument("--unitw_max", type=float, default=19.294, help="Maximum unit weight")
 
     # 재배치 계획 관련
-    parser.add_argument("--n_from_piles_reshuffle", type=int, default=15, help="Number of source piles for reshuffle")
-    parser.add_argument("--n_to_piles_reshuffle", type=int, default=15, help="Number of destination piles for reshuffle")
-    parser.add_argument("--n_plates_reshuffle", type=int, default=15, help="Average number of plates to reshuffle per pile")
+    parser.add_argument("--n_from_piles_reshuffle", type=int, default=5, help="Number of source piles for reshuffle")
+    parser.add_argument("--n_to_piles_reshuffle", type=int, default=5, help="Number of destination piles for reshuffle")
+    parser.add_argument("--n_plates_reshuffle", type=int, default=10, help="Average number of plates to reshuffle per pile")
     parser.add_argument("--safety_margin", type=int, default=0, help="Safety margin for reshuffle plan")
 
     # 네트워크 초기화 관련

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 import copy
+# network.py에서 가져오는 모델 및 상수들
 from network import SteelPlateConditionalMLPModel, pad_input_state_and_mask, MAX_SOURCE, MAX_DEST, PAD_INPUT_DIM
 import vessl
 
@@ -48,10 +49,12 @@ def make_batch(data_buffer, device):
         a_logprob_lst.append([transition['logprob']])
         v_val = transition['v'] if isinstance(transition['v'], float) else transition['v'].detach().cpu().item()
         v_lst.append([v_val])
+        # source_mask는 환경에서 얻은 actor용 mask (예: (MAX_SOURCE,))
         mask = transition['source_mask'].unsqueeze(0)
         source_mask_lst.append(mask)
         done = 1.0 if transition['done'] else 0.0
         done_lst.append([done])
+
     s       = torch.stack(s_lst, dim=0).to(device)
     s_prime = torch.stack(s_prime_lst, dim=0).to(device)
     a       = torch.tensor(a_lst,       dtype=torch.long,  device=device)
@@ -83,9 +86,7 @@ def main():
     print(f"P_coeff: {cfg.P_coeff}, V_coeff: {cfg.V_coeff}, E_coeff: {cfg.E_coeff}")
     print("=======================")
 
-    # --------------------------
     # 1) 엑셀 기반 reshuffle plan 생성 + 저장
-    # --------------------------
     rows = ['A','B']
     df_plan, _, _, _, _ = generate_reshuffle_plan(
         rows, cfg.n_from_piles_reshuffle, cfg.n_to_piles_reshuffle, cfg.n_plates_reshuffle, cfg.safety_margin
@@ -106,9 +107,7 @@ def main():
     print(f"From piles: {from_piles}, 개수={num_source}")
     print(f"Allowed piles: {allowed_piles}, 개수={num_dest}")
 
-    # --------------------------
     # 2) schedule 생성
-    # --------------------------
     schedule = []
     try:
         df = pd.read_excel(cfg.plates_data_path, sheet_name="reshuffle")
@@ -129,9 +128,7 @@ def main():
             p.from_pile = str(p.id)
             p.topile    = str(random.randint(0, num_pile-1))
 
-    # --------------------------
-    # 3) 모델 생성 (network.py)
-    # --------------------------
+    # 3) 모델 생성
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
         target_entropy=-math.log(1.0 / (MAX_SOURCE * MAX_DEST)),
@@ -142,7 +139,7 @@ def main():
         critic_init_std=cfg.critic_init_std
     ).to(device)
 
-    # --- 별도 actor, critic optimizer 및 scheduler 설정 ---
+    # Optimizer & LR Scheduler
     actor_params = list(model.source_head.parameters()) + list(model.cond_dest_head.parameters())
     critic_params = list(model.critic_net.parameters())
     actor_optimizer = optim.Adam(actor_params, lr=cfg.actor_lr)
@@ -217,10 +214,24 @@ def main():
         for t in range(T_horizon):
             batch_source_mask = []
             batch_dest_mask   = []
+
+            # ---- 1) 각 env의 마스크 계산 & 패딩 ----
             for i, env in enumerate(envs):
+                if dones[i]:
+                    # 이미 done이면 스킵
+                    continue
+
                 s_mask, d_mask = env.get_masks()
+
+                # 디버그 로그
+                # print(f"[DEBUG][Env {i}] step={t}, from_keys={env.from_keys}")
+                # print(f"[DEBUG][Env {i}] step={t}, s_mask(original): {s_mask.tolist()}")
+                # print(f"[DEBUG][Env {i}] step={t}, to_keys={env.to_keys}")
+                # print(f"[DEBUG][Env {i}] step={t}, d_mask(original): {d_mask.tolist()}")
+
                 s_mask = s_mask.to(device)
                 d_mask = d_mask.to(device)
+
                 if s_mask.size(0) < MAX_SOURCE:
                     pad_s = torch.zeros(MAX_SOURCE, dtype=torch.bool, device=device)
                     pad_s[:s_mask.size(0)] = s_mask
@@ -235,23 +246,47 @@ def main():
                 else:
                     d_mask = d_mask[:MAX_DEST]
 
+                # print(f"[DEBUG][Env {i}] step={t}, s_mask(after pad): {s_mask.tolist()}")
+                # print(f"[DEBUG][Env {i}] step={t}, d_mask(after pad): {d_mask.tolist()}")
+
                 batch_source_mask.append(s_mask)
                 batch_dest_mask.append(d_mask)
+            if len(batch_source_mask) < episodes_per_epoch:
+                # done되어 스킵된 env들은 전부 False mask로 채울 수도 있음 (옵션)
+                for _ in range(episodes_per_epoch - len(batch_source_mask)):
+                    dummy_s = torch.zeros(MAX_SOURCE, dtype=torch.bool, device=device)
+                    dummy_d = torch.zeros(MAX_DEST,   dtype=torch.bool, device=device)
+                    batch_source_mask.append(dummy_s)
+                    batch_dest_mask.append(dummy_d)
 
             batch_source_mask = torch.stack(batch_source_mask, dim=0)
             batch_dest_mask   = torch.stack(batch_dest_mask,   dim=0)
 
+            # print(f"[DEBUG] step={t}, batch_source_mask.shape={batch_source_mask.shape}")
+            # print(f"[DEBUG] step={t}, batch_dest_mask.shape={batch_dest_mask.shape}")
+
+            # ---- 2) 네트워크 액션 샘플링 ----
             actions_batch, logprobs_batch, values_batch, _ = model.act_batch(
-                states, input_mask, batch_source_mask, batch_dest_mask, greedy=False
+                states,
+                input_mask,
+                batch_source_mask,
+                batch_dest_mask,
+                greedy=False,
+                debug=False  # 네트워크 내부 디버깅
             )
 
+            # ---- 3) 각 env step ----
             for i in range(episodes_per_epoch):
+                if dones[i]:
+                    continue
+
                 action  = actions_batch[i]
                 logprob = logprobs_batch[i]
                 value   = values_batch[i]
 
                 src_idx = action[0].item()
                 dst_idx = action[1].item()
+
                 if src_idx >= len(envs[i].from_keys):
                     src_idx = 0
                 if dst_idx >= len(envs[i].to_keys):
@@ -278,13 +313,21 @@ def main():
                 ep_data[i].append(transition)
                 ep_rewards[i] += reward
                 ep_steps[i] += 1
+
                 dones[i] = done
-                states[i] = envs[i].reset().to(device) if done else next_state
-                input_mask[i] = torch.ones_like(states[i], dtype=torch.bool)
+                if done:
+                    # 만약 한 에폭 내 여러 에피소드 돌리고 싶으면 아래 줄 활성화:
+                    # states[i] = envs[i].reset().to(device)
+                    # dones[i] = False
+                    pass
+                else:
+                    states[i] = next_state
+                    input_mask[i] = torch.ones_like(states[i], dtype=torch.bool)
 
             if all(dones):
-                break
+                break  # 모든 env가 done이면 해당 T_horizon 도중이라도 종료
 
+        # ---- GAE 계산 등 ----
         for i in range(episodes_per_epoch):
             if len(ep_data[i]) > 0:
                 advantages = compute_gae(ep_data[i], cfg.gamma, cfg.lmbda)
@@ -305,6 +348,7 @@ def main():
                 print(f"조기 종료(Reward diff={reward_diff:.4f})")
                 break
 
+        # 평가 코드
         if epoch % cfg.eval_every == 0:
             print("----- Evaluation Start -----")
             backup_random = random.getstate()
@@ -378,6 +422,7 @@ def main():
             avg_eval = sum(total_rewards) / len(total_rewards)
             print("----- Evaluation End -----")
             print(f"[Eval] AvgReward={avg_eval:.2f}")
+            print(f"[Eval] AvgReversal={np.mean(total_reversals):.2f}")
 
             vessl.log({
                 "evaluation_reward": avg_eval,
@@ -405,7 +450,7 @@ def main():
             np.random.set_state(backup_numpy)
             torch.set_rng_state(backup_torch)
             model.train()
-
+        # ---- PPO Update ----
         mini_data_buffer = data_buffer.copy()
         data_buffer.clear()
         N = len(mini_data_buffer)
@@ -415,6 +460,7 @@ def main():
         mini_batch_size = cfg.mini_batch_size
         num_minibatches = max(1, N // mini_batch_size)
         indices = torch.randperm(N, device=device)
+
         total_loss = 0.0
         total_actor_loss = 0.0
         total_critic_loss = 0.0
@@ -428,26 +474,33 @@ def main():
                 batch_idx = indices[start:end]
                 mini_data = [mini_data_buffer[j] for j in batch_idx.cpu().tolist()]
                 mini_s, mini_a, mini_r, mini_adv, mini_s_prime, mini_a_logprob, mini_v, mini_source_mask, mini_done = make_batch(mini_data, device)
+
                 mini_adv = (mini_adv - mini_adv.mean()) / (mini_adv.std() + 1e-8)
                 with torch.no_grad():
                     input_mask_prime = torch.ones(mini_s_prime.shape, dtype=torch.bool, device=mini_s_prime.device)
                     selected_source = mini_a[:, 0]
                     v_next = model.forward(mini_s_prime, input_mask_prime, selected_source=selected_source)[2]
+
                 td_target = mini_r + cfg.gamma * v_next * (1.0 - mini_done)
+
                 B2 = mini_s.size(0)
                 dest_mask = torch.ones((B2, MAX_DEST), dtype=torch.bool, device=device)
                 input_mask_mini = torch.ones((B2, mini_s.shape[-1]), dtype=torch.bool, device=device)
+
                 new_a_logprob, new_v, dist_entropy = model.evaluate(
                     mini_s, input_mask_mini, mini_a, mini_source_mask, dest_mask
                 )
+
                 ratio = torch.exp(new_a_logprob - mini_a_logprob)
                 surr1 = ratio * mini_adv
                 surr2 = torch.clamp(ratio, 1.0 - cfg.eps_clip, 1.0 + cfg.eps_clip) * mini_adv
                 actor_loss = -cfg.P_coeff * torch.min(surr1, surr2).mean()
+
                 value_pred_clipped = mini_v + (new_v - mini_v).clamp(-cfg.value_clip_range, cfg.value_clip_range)
                 critic_loss_unclipped = F.smooth_l1_loss(new_v, td_target, reduction="none")
-                critic_loss_clipped = F.smooth_l1_loss(value_pred_clipped, td_target, reduction="none")
+                critic_loss_clipped   = F.smooth_l1_loss(value_pred_clipped, td_target, reduction="none")
                 critic_loss = cfg.V_coeff * torch.max(critic_loss_unclipped, critic_loss_clipped).mean()
+
                 entropy_loss = -cfg.E_coeff * dist_entropy.mean()
                 ppo_loss = actor_loss + critic_loss + entropy_loss
 
@@ -469,6 +522,7 @@ def main():
         avg_actor_loss = total_actor_loss / num_updates if num_updates > 0 else 0
         avg_critic_loss = total_critic_loss / num_updates if num_updates > 0 else 0
         avg_entropy_loss = total_entropy_loss / num_updates if num_updates > 0 else 0
+
         crane_move_value = np.mean([env.crane_move for env in envs])
         print(f"Epoch {epoch}: Loss={avg_loss:.4f} (Actor={avg_actor_loss:.4f}, Critic={avg_critic_loss:.4f}, Entropy={avg_entropy_loss:.4f}), Crane={crane_move_value:.2f}")
 

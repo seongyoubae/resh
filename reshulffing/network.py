@@ -291,41 +291,72 @@ class SteelPlateConditionalMLPModel(nn.Module):
     def act_batch(self, states, masks, source_masks=None, dest_masks=None, greedy=False, debug=False):
         self.eval()
         B = states.size(0)
+
+        # 첫 단계 source_policy 계산
         source_policy, _, value, emb = self.forward(states, masks, selected_source=None)
         if source_masks is None:
             source_masks = torch.ones(B, self.max_source, dtype=torch.bool, device=states.device)
+
+        if debug:
+            print("[DEBUG][Net.act_batch] source_masks:\n", source_masks)
+            print("[DEBUG][Net.act_batch] source_policy before mask:\n", source_policy)
+
+        # source 마스킹
         src_logits = torch.log(source_policy + 1e-10)
         src_logits = src_logits.masked_fill(~source_masks, float('-inf'))
         masked_src_policy = F.softmax(src_logits, dim=-1)
 
+        if debug:
+            print("[DEBUG][Net.act_batch] masked_src_policy after mask:\n", masked_src_policy)
+
+        # source 샘플링
         if greedy:
             selected_source = masked_src_policy.argmax(dim=-1)
         else:
             selected_source = torch.multinomial(masked_src_policy, 1).squeeze(1)
-        chosen_src_logprob = torch.gather(torch.log(masked_src_policy + 1e-10),
-                                           1,
-                                           selected_source.unsqueeze(1)).squeeze(1)
 
+        chosen_src_logprob = torch.gather(torch.log(masked_src_policy + 1e-10),
+                                          1,
+                                          selected_source.unsqueeze(1)).squeeze(1)
+
+        # 두 번째 단계 dest_policy 계산 (cond input)
         _, dest_policy, _, _ = self.forward(states, masks, selected_source=selected_source)
         if dest_masks is None:
             dest_masks = torch.ones(B, self.max_dest, dtype=torch.bool, device=states.device)
+
+        if debug:
+            print("[DEBUG][Net.act_batch] selected_source:\n", selected_source)
+            print("[DEBUG][Net.act_batch] dest_masks:\n", dest_masks)
+            print("[DEBUG][Net.act_batch] dest_policy before mask:\n", dest_policy)
+
+        # dest 마스킹
         dst_logits = torch.log(dest_policy + 1e-10)
         dst_logits = dst_logits.masked_fill(~dest_masks, float('-inf'))
         masked_dest_policy = F.softmax(dst_logits, dim=-1)
 
+        if debug:
+            print("[DEBUG][Net.act_batch] masked_dest_policy after mask:\n", masked_dest_policy)
+
+        # dest 샘플링
         if greedy:
             selected_dest = masked_dest_policy.argmax(dim=-1)
         else:
             selected_dest = torch.multinomial(masked_dest_policy, 1).squeeze(1)
+
         chosen_dest_logprob = torch.gather(torch.log(masked_dest_policy + 1e-10),
-                                            1,
-                                            selected_dest.unsqueeze(1)).squeeze(1)
+                                           1,
+                                           selected_dest.unsqueeze(1)).squeeze(1)
 
         joint_logprob = chosen_src_logprob + chosen_dest_logprob
         actions = torch.stack([selected_source, selected_dest], dim=-1)
 
         self.last_source_probs = masked_src_policy.detach().clone()
-        self.last_dest_probs   = masked_dest_policy.detach().clone()
+        self.last_dest_probs = masked_dest_policy.detach().clone()
+
+        if debug:
+            print("[DEBUG][Net.act_batch] final actions:\n", actions)
+            print("[DEBUG][Net.act_batch] chosen_src_logprob:\n", chosen_src_logprob)
+            print("[DEBUG][Net.act_batch] chosen_dest_logprob:\n", chosen_dest_logprob)
 
         return actions, joint_logprob, value.squeeze(-1), None
 
