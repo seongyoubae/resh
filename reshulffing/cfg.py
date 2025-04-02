@@ -27,7 +27,7 @@ def get_cfg():
     parser.add_argument("--episodes_per_epoch", type=int, default=64, help="Number of episodes to collect per epoch, mini batch size")
     parser.add_argument("--mini_batch_size", type=int, default=50, help="Fixed size of minibatches per PPO update, same with T_horizon")
     parser.add_argument("--K_epoch", type=int, default=3, help="Number of optimization epochs per update")
-    parser.add_argument("--n_epoch", type=int, default=5000, help="Total number of epochs")
+    parser.add_argument("--n_epoch", type=int, default=500, help="Total number of epochs")
     parser.add_argument("--P_coeff", type=float, default=1.0, help="Coefficient for policy loss")
     parser.add_argument("--V_coeff", type=float, default=0.5, help="Coefficient for value loss")
     parser.add_argument("--E_coeff", type=float, default=0.01, help="Coefficient for entropy loss")
@@ -37,11 +37,12 @@ def get_cfg():
     parser.add_argument("--new_instance_every", type=int, default=1000, help="Generate new scenarios every x episodes")
     parser.add_argument("--value_clip_range", type=float, default=1.0, help="Value clipping range for critic update")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm for model parameters")
+    
     # 파일 및 저장 관련
     parser.add_argument("--plates_data_path", type=str, default="output/reshuffle_plan.xlsx", help="Path to the plates data Excel file")
     parser.add_argument("--evaluation_plates_data_path", type=str, default="output/reshuffle_plan(for eval).xlsx", help="Path to the plates eval data Excel file")
     parser.add_argument("--log_file", type=str, default="training_log.csv", help="Path for training log CSV file")
-    parser.add_argument("--save_model_dir", type=str, default="output", help="Directory to save models")
+    parser.add_argument("--save_model_dir", type=str, default="/output", help="Directory to save models")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save output Excel files")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the model on (cuda or cpu)")
 
