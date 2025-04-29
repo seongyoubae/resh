@@ -2,317 +2,459 @@ import random
 import numpy as np
 import torch
 import os
-import csv
 import pandas as pd
 import copy
 import math
 from cfg import get_cfg
-import data as plate  # data.py에 정의된 Plate 클래스 및 함수들
+import data as plate
+from data import Plate
+from network import MAX_SOURCE, MAX_DEST
 
-
-def simulate_transfer(move_data, piles_from, piles_to):
-    cfg = get_cfg()
-    max_num = cfg.max_stack
-    reversal = 0
-    piles_from_copy = {k: [copy.copy(item) for item in v] for k, v in piles_from.items()}
-    piles_to_copy = {k: [copy.copy(item) for item in v] for k, v in piles_to.items()}
-    for target in move_data:
-        src_key, dst_key = target
-        if len(piles_to_copy[dst_key]) > max_num:
-            reversal = 9999999999
-            return reversal, piles_to_copy
-        plate_to_move = piles_from_copy[src_key].pop()
-        if piles_to_copy[dst_key] and (piles_to_copy[dst_key][-1].outbound < plate_to_move.outbound):
-            reversal += 1
-        piles_to_copy[dst_key].append(plate_to_move)
-    return reversal, piles_to_copy
-
-
+# === 키 정규화 함수 ===
 def normalize_keys(schedule):
-    """
-    schedule 내 각 Plate 객체의 from_pile, topile 값을 정규화합니다.
-    원래 값(예: "A01", "A15" 등)을 고유하게 모은 후,
-    "from_00", "from_01", ... 및 "to_00", "to_01", ... 형태로 매핑합니다.
-    """
-    # 원래 키들을 문자열로 정리한 후 정렬
-    unique_from = sorted(list({str(p.from_pile).strip() for p in schedule}))
-    unique_to = sorted(list({str(p.topile).strip() for p in schedule}))
+    """스케줄 내 파일(Pile) 키를 정규화하고 정규화된 키 목록 반환"""
+    if not schedule: return [], [], []
 
-    # 정규화된 키 생성 (예: "from_00", "from_01", ...)
-    from_key_map = {key: f"from_{i:02d}" for i, key in enumerate(unique_from)}
-    to_key_map = {key: f"to_{i:02d}" for i, key in enumerate(unique_to)}
+    original_from_keys_set = set()
+    original_to_keys_set = set()
+    valid_schedule_input = []
 
-    # 모든 Plate 객체에 대해 키를 정규화
+    # 유효한 Plate 객체 필터링 및 원본 키 추출
     for p in schedule:
-        p.from_pile = from_key_map[str(p.from_pile).strip()]
-        p.topile = to_key_map[str(p.topile).strip()]
-    return schedule, list(from_key_map.values()), list(to_key_map.values())
+        if isinstance(p, Plate) and \
+           hasattr(p, 'from_pile') and p.from_pile is not None and \
+           hasattr(p, 'topile') and p.topile is not None and \
+           hasattr(p, 'outbound') and isinstance(getattr(p, 'outbound'), (int, float)):
+             valid_schedule_input.append(p)
+             original_from_keys_set.add(str(p.from_pile).strip())
+             original_to_keys_set.add(str(p.topile).strip())
 
+    if not valid_schedule_input or not original_from_keys_set or not original_to_keys_set:
+        print("[Warning] normalize_keys: 유효 스케줄 또는 파일 부족.")
+        return [], [], []
 
+    # 원본 키 목록 정렬 및 최대 개수 제한
+    unique_original_from_list = sorted(list(original_from_keys_set))[:MAX_SOURCE]
+    unique_original_to_list = sorted(list(original_to_keys_set))[:MAX_DEST]
+
+    if not unique_original_from_list or not unique_original_to_list:
+        print("[Warning] normalize_keys: MAX 제한 후 유효 파일 없음.")
+        return [], [], []
+
+    # 원본 키 -> 정규화 키 매핑 생성
+    from_key_map = {key: f"from_{i:02d}" for i, key in enumerate(unique_original_from_list)}
+    to_key_map = {key: f"to_{i:02d}" for i, key in enumerate(unique_original_to_list)}
+
+    normalized_schedule_final = []
+    default_norm_to_key = list(to_key_map.values())[0] # 기본 정규화된 도착 키
+
+    # 스케줄 내 Plate 객체들의 키 속성 정규화 (덮어쓰기)
+    for p in valid_schedule_input:
+        original_from = str(p.from_pile).strip()
+        original_to = str(p.topile).strip()
+        norm_from = from_key_map.get(original_from)
+        norm_to = to_key_map.get(original_to)
+
+        # 유효한 출발 파일 키가 있는 경우만 처리
+        if norm_from is not None:
+            normalized_p = copy.copy(p) # 객체 복사
+            setattr(normalized_p, 'from_pile', norm_from) # 정규화된 키로 덮어쓰기
+            setattr(normalized_p, 'topile', norm_to if norm_to is not None else default_norm_to_key) # 정규화된 키로 덮어쓰기
+            normalized_schedule_final.append(normalized_p)
+
+    # 최종 사용될 정규화된 키 목록 반환
+    final_from_keys = list(from_key_map.values())
+    final_to_keys = list(to_key_map.values())
+
+    return normalized_schedule_final, final_from_keys, final_to_keys
+
+# --- Locating Environment Class ---
 class Locating(object):
-    def __init__(self, num_pile=10, max_stack=30,
+    """
+    강판 재배치 RL 환경 클래스
+    - 파일 키 정규화 사용
+    - Potential-Based Reward Shaping 적용 (블로킹 최소화 목표)
+    - 최종 상태 엑셀 출력 시 원본 파일 키 사용
+    """
+    def __init__(self, max_stack=30,
                  inbound_plates=None,
-                 observe_inbounds=False, display_env=False,
-                 device="cuda",
-                 crane_penalty=0.0,
-                 # from_keys, to_keys 인자는 제거하거나 사용하지 않음
-                 num_stack=None):
-        """
-        강판 재배치 환경을 초기화합니다.
-        """
-        self.num_pile = num_pile
-        self.max_stack = max_stack
-        self.num_stack = num_stack
-        self.stage = 0
-        self.current_date = 0
-        self.crane_move = 0
-        self.plates = {}
-        self.observe_inbounds = observe_inbounds
-        self.device = device
-        self.crane_penalty = crane_penalty
+                 observe_inbounds=False, # 현재 로직에서 사용 안 됨
+                 device="cuda", # 현재 로직에서 사용 안 됨
+                 crane_penalty=0.0):
 
-        cfg = get_cfg()
+        self.max_stack = int(max_stack)
+        self.stage = 0 # 현재까지 이동한 횟수
+        self.current_date = 0 # 사용되지 않음 (필요 시 로직 추가)
+        self.crane_move = 0 # 크레인 이동 횟수 (단순 카운트)
+        self.plates = {}    # 현재 파일 상태 (key: 정규화된 키, value: Plate 리스트)
+        self.crane_penalty = float(crane_penalty)
+
+        cfg = get_cfg() # 설정 로드
+        schedule_to_process = None # 원본 스케줄 리스트 (정규화 전)
+
+        # === 1. 스케줄 준비 (외부 입력 > 파일 로드 > 기본 생성) ===
         if inbound_plates:
-            # 전달된 schedule에 대해 normalize_keys를 호출하여 키를 정규화
-            self.inbound_plates, normalized_from, normalized_to = normalize_keys(inbound_plates)
-            # print("DEBUG: 정규화된 from_keys:", normalized_from)
-            # print("DEBUG: 정규화된 to_keys:", normalized_to)
-            self.inbound_clone = self.inbound_plates[:]
-            self.from_keys = normalized_from
-            self.to_keys = normalized_to
+            schedule_to_process = copy.deepcopy(inbound_plates)
+            # print("[정보] 외부 스케줄로 초기화.") # 정보 메시지 제거
         else:
             try:
-                df = pd.read_excel(cfg.plates_data_path, sheet_name="reshuffle")
-                schedule = []
+                plates_data_path = getattr(cfg, 'plates_data_path', 'output/reshuffle_plan.xlsx')
+                # print(f"[정보] 초기 스케줄 로드 시도: {plates_data_path}") # 정보 메시지 제거
+                df = pd.read_excel(plates_data_path, sheet_name="reshuffle")
+                loaded_schedule = []
+                required_cols = ["pileno", "inbound", "outbound", "unitw", "topile"]
+                if not all(col in df.columns for col in required_cols):
+                    print(f"[경고] Excel 파일({plates_data_path}) 필수 컬럼 부족: {required_cols}") # 경고 유지
+
+                # 기본값 설정을 위한 cfg 값 (없으면 기본값 사용)
+                cfg_inbound_min = getattr(cfg, 'inbound_min', 1); cfg_inbound_max = getattr(cfg, 'inbound_max', 10)
+                cfg_outbound_extra_min = getattr(cfg, 'outbound_extra_min', 1); cfg_outbound_extra_max = getattr(cfg, 'outbound_extra_max', 10)
+                cfg_unitw_min = getattr(cfg, 'unitw_min', 0.1); cfg_unitw_max = getattr(cfg, 'unitw_max', 10.0)
+
                 for idx, row in df.iterrows():
-                    plate_id = row["pileno"]
-                    inbound = row["inbound"] if ("inbound" in df.columns and not pd.isna(row["inbound"])) else random.randint(cfg.inbound_min, cfg.inbound_max)
-                    outbound = row["outbound"] if ("outbound" in df.columns and not pd.isna(row["outbound"])) else inbound + random.randint(cfg.outbound_extra_min, cfg.outbound_extra_max)
-                    unitw = row["unitw"] if ("unitw" in df.columns and not pd.isna(row["unitw"])) else random.uniform(cfg.unitw_min, cfg.unitw_max)
-                    if "topile" in df.columns and not pd.isna(row["topile"]):
-                        to_pile = str(row["topile"]).strip()
-                    else:
-                        to_pile = "A01"
-                    p = plate.Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
-                    p.from_pile = str(plate_id).strip()
+                    plate_id = row.get("pileno", f"Plate_{idx}")
+                    inbound = int(row.get("inbound", random.randint(cfg_inbound_min, cfg_inbound_max)))
+                    outbound = int(row.get("outbound", inbound + random.randint(cfg_outbound_extra_min, cfg_outbound_extra_max)))
+                    unitw = float(row.get("unitw", random.uniform(cfg_unitw_min, cfg_unitw_max)))
+                    to_pile = str(row.get("topile", f"D_{idx % MAX_DEST}")).strip()
+                    from_pile_val = str(row.get("pileno", f"S_{idx % MAX_SOURCE}")).strip()
+
+                    p = Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
+                    p.from_pile = from_pile_val
                     p.topile = to_pile
-                    schedule.append(p)
-                if len(schedule) == 0:
-                    raise ValueError("Excel 파일에서 불러온 schedule이 비어 있습니다")
-                # normalize_keys 호출
-                schedule, normalized_from, normalized_to = normalize_keys(schedule)
-                # print("DEBUG: 정규화된 from_keys:", normalized_from)
-                # print("DEBUG: 정규화된 to_keys:", normalized_to)
-                self.inbound_plates = schedule
-                self.inbound_clone = self.inbound_plates[:]
-                self.from_keys = normalized_from
-                self.to_keys = normalized_to
+                    loaded_schedule.append(p)
+
+                if not loaded_schedule: raise ValueError("Excel 스케줄 비어있음.")
+                schedule_to_process = loaded_schedule
+                # print(f"[정보] 초기 스케줄 로드 완료: {plates_data_path} ({len(schedule_to_process)}개)") # 정보 메시지 제거
+            except FileNotFoundError:
+                # print(f"[경고] Excel 파일({plates_data_path}) 없음. 기본 스케줄 생성.") # 정보 메시지 제거
+                num_plates_default = getattr(cfg, 'num_plates', 50)
+                schedule_to_process = plate.generate_schedule(num_plates=num_plates_default)
+                for i, p in enumerate(schedule_to_process):
+                    if not hasattr(p, 'from_pile'): p.from_pile = f"S_{i % MAX_SOURCE}"
+                    if not hasattr(p, 'topile'): p.topile = f"D_{i % MAX_DEST}"
+                # print(f"[정보] 기본 스케줄 생성 완료 ({len(schedule_to_process)}개).") # 정보 메시지 제거
             except Exception as e:
-                print("Excel 파일 로드 오류:", e)
-                self.inbound_plates = plate.generate_schedule(num_plates=cfg.num_plates)
-                for p in self.inbound_plates:
-                    p.from_pile = str(p.id)
-                    p.topile = str(random.randint(0, self.num_pile - 1))
-                self.inbound_clone = self.inbound_plates[:]
-                self.from_keys = sorted(list({p.from_pile for p in self.inbound_clone}))
-                self.to_keys = sorted(list({p.topile for p in self.inbound_clone}))
+                print(f"[오류] 스케줄 로드/생성 중 오류: {e}") # 오류 메시지 유지
+                raise ValueError("스케줄 초기화 실패")
 
-        # 외부 인자는 사용하지 않고, 내부에서 정규화된 키를 사용합니다.
-        schedule = self.inbound_clone[:]
-        self.allowed_to = sorted(list({p.topile for p in schedule}))
-        if self.from_keys is None:
-            self.from_keys = sorted(list({p.from_pile for p in schedule}))
-        if self.to_keys is None:
-            self.to_keys = self.allowed_to
+        if not schedule_to_process:
+            raise ValueError("처리할 스케줄 없음.") # 오류 메시지 유지
 
-        self.index_to_key = {i: key for i, key in enumerate(self.from_keys)}
-        self.key_to_index = {key: i for i, key in enumerate(self.from_keys)}
-        self.plates = {key: [] for key in self.from_keys}
-        self.pile_states = [False] * self.num_pile
-        self.last_reversal = 0
+        # === 2. 원본 목표 파일 정보 저장 (`original_intended_topile` 속성 추가) ===
+        for p in schedule_to_process:
+            original_topile_val = None
+            if isinstance(p, Plate) and hasattr(p, 'topile') and p.topile is not None:
+                original_topile_val = str(p.topile).strip()
+            setattr(p, 'original_intended_topile', original_topile_val)
 
+        # === 3. 키 정규화 수행 ===
+        normalized_schedule, self.from_keys, self.to_keys = normalize_keys(schedule_to_process)
+        self.inbound_plates = normalized_schedule # 정규화된 스케줄 (Plate 객체 리스트)
+        self.inbound_clone = copy.deepcopy(self.inbound_plates) # 리셋용 복사본
+
+        if not self.from_keys or not self.to_keys:
+             raise ValueError("키 정규화 후 유효 Source/Dest 파일 없음.") # 오류 메시지 유지
+
+        # === 4. 역매핑 정보 생성 (`self.norm_to_orig_map`) ===
+        self.norm_to_orig_map = {} # 초기화
+        try:
+            # 원본 스케줄에서 사용된 실제 키 목록 추출 (정렬 및 개수 제한)
+            original_from_keys_used = sorted(list(set(str(p.from_pile).strip() for p in schedule_to_process if hasattr(p, 'from_pile') and p.from_pile is not None)))[:MAX_SOURCE]
+            original_to_keys_used = sorted(list(set(p.original_intended_topile for p in schedule_to_process if hasattr(p, 'original_intended_topile') and p.original_intended_topile is not None)))[:MAX_DEST]
+
+            # 정규화된 키와 원본 키 매칭 (개수 일치 확인)
+            if len(self.from_keys) == len(original_from_keys_used):
+                norm_to_orig_from_map = {norm_key: orig_key for norm_key, orig_key in zip(self.from_keys, original_from_keys_used)}
+            else:
+                print(f"[Warning] __init__: From 키 개수 불일치 ({len(self.from_keys)} vs {len(original_from_keys_used)}).") # 경고 유지
+                norm_to_orig_from_map = {}
+            if len(self.to_keys) == len(original_to_keys_used):
+                norm_to_orig_to_map = {norm_key: orig_key for norm_key, orig_key in zip(self.to_keys, original_to_keys_used)}
+            else:
+                print(f"[Warning] __init__: To 키 개수 불일치 ({len(self.to_keys)} vs {len(original_to_keys_used)}).") # 경고 유지
+                norm_to_orig_to_map = {}
+            self.norm_to_orig_map = {**norm_to_orig_from_map, **norm_to_orig_to_map}
+
+            if not self.norm_to_orig_map: print("[Warning] __init__: 역매핑 정보 비어있음.") # 경고 유지
+            # else: print("[정보] 정규화 키 -> 원본 키 역매핑 생성 완료.") # --- 출력 제거 ---
+
+        except Exception as e:
+            print(f"[오류] __init__: 역매핑 생성 오류: {e}") # 오류 유지
+            print("[경고] 역매핑 정보 생성 실패.") # 경고 유지
+            self.norm_to_orig_map = {}
+        # --- 역매핑 생성 끝 ---
+
+        # === 5. 나머지 멤버 변수 설정 ===
+        self.all_pile_keys = sorted(list(set(self.from_keys + self.to_keys)))
+        self.source_index_to_key = {i: key for i, key in enumerate(self.from_keys)}
+        self.source_key_to_index = {key: i for i, key in enumerate(self.from_keys)}
+        self.dest_index_to_key = {i: key for i, key in enumerate(self.to_keys)}
+        self.dest_key_to_index = {key: i for i, key in enumerate(self.to_keys)}
+        self.plates = {} # 플레이트 상태 (reset에서 초기화)
+        # print(f"[정보] 환경 초기화 완료: Source {len(self.from_keys)}({MAX_SOURCE}), Dest {len(self.to_keys)}({MAX_DEST}). Max Stack {self.max_stack}.") # --- 출력 제거 ---
 
     def reset(self, shuffle_schedule=False):
-        cfg = get_cfg()
-        schedule = copy.deepcopy(self.inbound_clone)
-        if shuffle_schedule:
-            random.shuffle(schedule)
-        self.plates = {key: [] for key in self.from_keys}
+        """환경을 초기 상태로 리셋합니다."""
+        schedule = copy.deepcopy(self.inbound_clone) # 정규화된 스케줄 복사본 사용
+        if not schedule:
+             print("[Warning] Reset: 스케줄 없음.") # 경고 유지
+             self.plates = {key: [] for key in self.from_keys + self.to_keys}
+             self.current_date = 0; self.crane_move = 0; self.stage = 0
+             self.total_plate_count = 0; self.move_data = []
+             return self._get_state()
+
+        if shuffle_schedule: random.shuffle(schedule)
+
+        # self.plates 딕셔너리 초기화 (모든 from/to 키 포함)
+        self.plates = {key: [] for key in self.from_keys + self.to_keys}
+        actual_plate_count = 0
+        # 정규화된 스케줄의 플레이트를 정규화된 from_pile 키에 따라 분배
         for p in schedule:
-            if p.from_pile not in self.plates:
-                self.plates[p.from_pile] = []
-            self.plates[p.from_pile].append(p)
-        # 디버깅: 각 정규화된 from_key에 할당된 plate 개수 출력
-        # for key in self.from_keys:
-            # print(f"DEBUG: {key} has {len(self.plates.get(key, []))} plates")
-        all_plates = []
-        for key in self.plates:
-            all_plates.extend(self.plates[key])
-        self.current_date = min([p.inbound for p in all_plates]) if all_plates else 0
+            if hasattr(p, 'from_pile') and p.from_pile in self.from_keys:
+                 self.plates[p.from_pile].append(p)
+                 actual_plate_count += 1
+
+        # 현재 날짜 설정 (사용되지 않음)
+        valid_inbound_plates = [p for p in schedule if hasattr(p, 'inbound') and isinstance(p.inbound, (int, float))]
+        self.current_date = min([p.inbound for p in valid_inbound_plates]) if valid_inbound_plates else 0
+
+        # 상태 변수 초기화
         self.crane_move = 0
         self.stage = 0
-        self.total_plate_count = sum(len(lst) for lst in self.plates.values())
+        self.total_plate_count = actual_plate_count
+        if self.total_plate_count == 0: print("[Warning] Reset 후 이동할 플레이트 없음.") # 경고 유지
         self.move_data = []
-        self.initial_plates = copy.deepcopy(self.plates)
-        self.initial_dest = {k: [] for k in self.to_keys}
-        self.update_pile_states()
-        return self._get_state()
+        return self._get_state() # 초기 상태 반환
+
+    def _get_max_move_for_pile(self, pile):
+        """주어진 파일 내 최대 블로킹 수 계산 (목표: 블로킹 최소화)"""
+        n_pile = len(pile)
+        if n_pile <= 1: return 0
+
+        max_move = 0
+        for i in range(n_pile - 1): # i: 아래 판 인덱스
+            plate_i = pile[i]
+            if not (hasattr(plate_i, 'outbound') and isinstance(plate_i.outbound, (int, float))): continue
+            outbound_i = plate_i.outbound
+
+            move = 0
+            for j in range(i + 1, n_pile): # j: 위 판 인덱스
+                plate_j = pile[j]
+                if not (hasattr(plate_j, 'outbound') and isinstance(plate_j.outbound, (int, float))): continue
+                outbound_j = plate_j.outbound
+
+                # --- 핵심 로직: 블로킹 카운트 ---
+                # 아래 판(i)이 위 판(j)보다 나중에 나가야 할 경우(outbound_i > outbound_j)
+                if outbound_i > outbound_j:
+                    move += 1
+
+            max_move = max(max_move, move)
+        return max_move
 
     def step(self, action):
+        """환경 스텝 함수"""
         s_next, reward, done, info = self._composite_step(action)
-        self.update_pile_states()
         return s_next, reward, done, info
 
-    def _calculate_reward(self, pile_key):
-        pile = self.plates[pile_key]
-        if len(pile) <= 1:
-            return 0.0
-        reversal = 0
-        for i, plate_obj in enumerate(pile[:-1]):
-            for upper in pile[i + 1:]:
-                if plate_obj.outbound < upper.outbound:
-                    reversal += 1
-        reward = 2.0 - math.log(1 + reversal)
-        if reward < 0:
-            reward = 0.0
-        return reward
-
     def _composite_step(self, action):
-        from_index, to_index = action
+        """행동 실행 및 결과 반환 (Potential-Based Reward Shaping)"""
         valid_source_mask, valid_dest_mask = self.get_masks()
-        # print(f"[DEBUG] _composite_step: valid_source_mask = {valid_source_mask}")
-        # print(f"[DEBUG] _composite_step: valid_dest_mask = {valid_dest_mask}")
+        cfg = get_cfg()
+        gamma = getattr(cfg, "gamma", 0.99)
+        shaping_reward_scale = getattr(cfg, "shaping_reward_scale", 1.0)
 
-        if not valid_source_mask[from_index] or not valid_dest_mask[to_index]:
-            valid_source_indices = [i for i, flag in enumerate(valid_source_mask.tolist()) if flag]
-            valid_dest_indices = [j for j, flag in enumerate(valid_dest_mask.tolist()) if flag]
+        # 1. 행동 전 포텐셜 계산 (블로킹 지표 사용)
+        potential_before = -sum(self._get_max_move_for_pile(self.plates.get(key, [])) for key in self.to_keys)
+
+        from_index, to_index = action
+
+        # 2. 액션 유효성 검사 및 필요시 랜덤 유효 액션으로 대체
+        is_action_invalid = False
+        if not (0 <= from_index < len(self.from_keys)) or not valid_source_mask[from_index]: is_action_invalid = True
+        if not (0 <= to_index < len(self.to_keys)) or not valid_dest_mask[to_index]: is_action_invalid = True
+
+        if is_action_invalid:
+            valid_source_indices = torch.where(valid_source_mask[:len(self.from_keys)])[0].tolist()
+            valid_dest_indices = torch.where(valid_dest_mask[:len(self.to_keys)])[0].tolist()
             if not valid_source_indices or not valid_dest_indices:
-                done = True
-                return self._get_state(), 0.0, done, {}
-            if hasattr(self, "last_source_probs") and hasattr(self, "last_dest_probs"):
-                src_probs = self.last_source_probs[valid_source_indices]
-                dest_probs = self.last_dest_probs[valid_dest_indices]
-                src_probs = src_probs / src_probs.sum()
-                dest_probs = dest_probs / dest_probs.sum()
-                from_index = np.random.choice(valid_source_indices, p=src_probs.cpu().numpy())
-                to_index = np.random.choice(valid_dest_indices, p=dest_probs.cpu().numpy())
-                print("[DEBUG] fallback (softmax-based): chosen from_index:", from_index, "chosen to_index:", to_index)
-            else:
-                from_index = random.choice(valid_source_indices)
-                to_index = random.choice(valid_dest_indices)
-                print("[DEBUG] fallback (uniform random): chosen from_index:", from_index, "chosen to_index:", to_index)
-        source_key = self.from_keys[from_index]
-        destination_key = self.to_keys[to_index] if to_index < len(self.to_keys) else self.to_keys[0]
-        if destination_key not in self.plates:
-            self.plates[destination_key] = []
-        if len(self.plates[destination_key]) >= self.max_stack:
-            valid_dest_indices = [j for j, flag in enumerate(valid_dest_mask.tolist()) if flag]
-            if not valid_dest_indices:
-                done = True
-                return self._get_state(), 0.0, done, {}
-            if hasattr(self, "last_dest_probs"):
-                dest_probs = self.last_dest_probs[valid_dest_indices]
-                dest_probs = dest_probs / dest_probs.sum()
-                to_index = np.random.choice(valid_dest_indices, p=dest_probs.cpu().numpy())
-            else:
-                to_index = random.choice(valid_dest_indices)
-            destination_key = self.to_keys[to_index]
-        if not self.plates.get(source_key, []):
-            valid_source_indices = [i for i, flag in enumerate(valid_source_mask.tolist()) if flag]
-            if not valid_source_indices:
-                done = True
-                return self._get_state(), 0.0, done, {}
-            if hasattr(self, "last_source_probs"):
-                src_probs = self.last_source_probs[valid_source_indices]
-                src_probs = src_probs / src_probs.sum()
-                from_index = np.random.choice(valid_source_indices, p=src_probs.cpu().numpy())
-            else:
-                from_index = random.choice(valid_source_indices)
-            source_key = self.from_keys[from_index]
-        moved_plate = self.plates[source_key].pop()
-        if self.plates[destination_key]:
-            last_plate = self.plates[destination_key][-1]
-            if last_plate.outbound < moved_plate.outbound:
-                immediate_reward = -1
-            else:
-                immediate_reward = 1
-        else:
-            immediate_reward = 0
-        moved_plate.topile = destination_key
-        self.plates[destination_key].append(moved_plate)
-        self.move_data.append((source_key, destination_key))
+                print(f"[오류] Step {self.stage}: 대체 유효 행동 없음. 종료.") # 오류 유지
+                return self._get_state(), 0.0, True, {"error": "No valid moves available"}
+            from_index = random.choice(valid_source_indices)
+            to_index = random.choice(valid_dest_indices)
+
+        source_key = self.from_keys[from_index] # 정규화된 키
+        destination_key = self.to_keys[to_index] # 정규화된 키
+
+        # 3. 이동 실행 전 상태 확인 (오류 방지)
+        current_dest_pile = self.plates.get(destination_key, [])
+        if len(current_dest_pile) >= self.max_stack:
+             print(f"[오류] Step {self.stage}: 목적지 '{destination_key}' Full!") # 오류 유지
+             return self._get_state(), 0.0, True, {"error": f"Destination '{destination_key}' full"}
+        current_source_pile = self.plates.get(source_key)
+        if not current_source_pile:
+             print(f"[오류] Step {self.stage}: 출발지 '{source_key}' Empty!") # 오류 유지
+             return self._get_state(), 0.0, True, {"error": f"Source '{source_key}' empty"}
+
+        # 4. 플레이트 이동 실행
+        try:
+             moved_plate = current_source_pile.pop()
+             self.plates[destination_key].append(moved_plate)
+        except IndexError:
+              print(f"[심각] Step {self.stage}: 비어있는 '{source_key}'에서 pop 시도!") # 오류 유지
+              return self._get_state(), 0.0, True, {"error": "Pop from empty pile"}
+
+        # 5. 행동 후 포텐셜 계산
+        potential_after = -sum(self._get_max_move_for_pile(self.plates.get(key, [])) for key in self.to_keys)
+
+        # 6. 형태 보상(Shaping Reward) 계산 및 스케일 적용
+        shaping_reward = gamma * potential_after - potential_before
+        shaping_reward *= shaping_reward_scale
+        total_reward = shaping_reward # 현재 보상은 이것만 사용
+
+        # 7. 상태 업데이트
+        self.move_data.append((source_key, destination_key)) # 이동 기록
         self.crane_move += 1
         self.stage += 1
+
+        # 8. 종료 조건 확인
         done = self.stage >= self.total_plate_count
+        if self.total_plate_count <= 0: done = True
+
+        # 9. 다음 상태 가져오기
         next_state = self._get_state()
-        if next_state.abs().sum().item() < 1e-6:
-            done = True
+
+        # 10. 종료 시 정보(info) 설정 (최종 평가 지표 포함)
+        info = {}
         if done:
-            final_reversal, _ = simulate_transfer(self.move_data, self.initial_plates, self.initial_dest)
-            self.last_reversal = final_reversal
+            total_max_move_final = sum(self._get_max_move_for_pile(self.plates.get(key, [])) for key in self.to_keys)
+            info['final_max_move_sum'] = total_max_move_final
 
-        # print(f"[DEBUG] _composite_step: from_key = {source_key}, to_key = {destination_key}, reward = {immediate_reward}")
-        return next_state, immediate_reward, done, {}
-
-    def update_pile_states(self):
-        self.pile_states = [False] * self.num_pile
-        for i, key in enumerate(self.from_keys):
-            if i < self.num_pile:
-                self.pile_states[i] = len(self.plates.get(key, [])) > 0
-        # print(f"[DEBUG] update_pile_states: {self.pile_states}")
+        return next_state, total_reward, done, info
 
     def _get_state(self):
-        state_values = []
-        # from_keys에 해당하는 각 pile 처리 (예: 5개)
-        for key in self.from_keys:
-            pile = self.plates.get(key, [])
-            top_outbounds = [float(p.outbound) for p in pile[:self.max_stack]]
-            if len(top_outbounds) < self.max_stack:
-                top_outbounds += [0.0] * (self.max_stack - len(top_outbounds))
-            avg_outbound = np.mean([float(p.outbound) for p in pile]) if pile else 0.0
-            state_values.extend(top_outbounds + [avg_outbound])
-        # to_keys에 해당하는 각 pile 처리 (예: 5개)
-        for key in self.to_keys:
-            pile = self.plates.get(key, [])
-            top_outbounds = [float(p.outbound) for p in pile[:self.max_stack]]
-            if len(top_outbounds) < self.max_stack:
-                top_outbounds += [0.0] * (self.max_stack - len(top_outbounds))
-            avg_outbound = np.mean([float(p.outbound) for p in pile]) if pile else 0.0
-            state_values.extend(top_outbounds + [avg_outbound])
+        """환경 상태를 모델 입력 텐서로 변환합니다."""
+        cfg = get_cfg()
+        current_max_stack = getattr(cfg, 'max_stack', self.max_stack)
+        pile_feature_dim = current_max_stack + 1
+        padding_feature = [0.0] * pile_feature_dim
+        state_features = []
 
-        total_piles = len(self.from_keys) + len(self.to_keys)
-        pile_feature_dim = self.max_stack + 1
-        state_tensor = torch.tensor(state_values, dtype=torch.float).view(total_piles, pile_feature_dim)
+        # Source Piles 특징 추출
+        for i in range(MAX_SOURCE):
+            feature_vector = padding_feature[:] # 리스트 복사하여 사용
+            if i < len(self.from_keys):
+                key = self.from_keys[i]; pile = self.plates.get(key, [])
+                if pile:
+                    n_pile = len(pile)
+                    # 상단 플레이트 outbound (리스트 컴프리헨션, 할당 표현식)
+                    top_outbounds = [
+                        float(ob) if isinstance(ob := getattr(p, 'outbound', 0.0), (int, float)) else 0.0
+                        for k in range(n_pile - 1, max(-1, n_pile - 1 - current_max_stack), -1)
+                        if (p := pile[k]) # Check if p exists (not strictly needed due to range but safer)
+                    ]
+                    padded_top_outbounds = top_outbounds + [0.0] * (current_max_stack - len(top_outbounds))
+                    # 평균 outbound (리스트 컴프리헨션, 할당 표현식)
+                    valid_outbounds = [float(val) for p in pile if isinstance((val := getattr(p, 'outbound', None)), (int, float))]
+                    avg_outbound = sum(valid_outbounds) / len(valid_outbounds) if valid_outbounds else 0.0
+                    feature_vector = padded_top_outbounds + [avg_outbound]
+            state_features.append(feature_vector)
+
+        # Destination Piles 특징 추출
+        for j in range(MAX_DEST):
+             feature_vector = padding_feature[:]
+             if j < len(self.to_keys):
+                key = self.to_keys[j]; pile = self.plates.get(key, [])
+                if pile:
+                    n_pile = len(pile)
+                    top_outbounds = [
+                        float(ob) if isinstance(ob := getattr(p, 'outbound', 0.0), (int, float)) else 0.0
+                        for k in range(n_pile - 1, max(-1, n_pile - 1 - current_max_stack), -1)
+                        if (p := pile[k])
+                    ]
+                    padded_top_outbounds = top_outbounds + [0.0] * (current_max_stack - len(top_outbounds))
+                    valid_outbounds = [float(val) for p in pile if isinstance((val := getattr(p, 'outbound', None)), (int, float))]
+                    avg_outbound = sum(valid_outbounds) / len(valid_outbounds) if valid_outbounds else 0.0
+                    feature_vector = padded_top_outbounds + [avg_outbound]
+             state_features.append(feature_vector)
+
+        # 최종 상태 텐서 생성 (오류 처리 포함)
+        try:
+            state_tensor = torch.tensor(state_features, dtype=torch.float).cpu()
+            expected_shape = (MAX_SOURCE + MAX_DEST, pile_feature_dim)
+            if state_tensor.shape != expected_shape:
+                print(f"[Warning] _get_state: shape 불일치! {state_tensor.shape} vs {expected_shape}. Reshape.") # 경고 유지
+                state_tensor = state_tensor.reshape(expected_shape)
+        except Exception as e:
+            print(f"[오류] _get_state: 상태 텐서 생성 실패: {e}. 제로 텐서 반환.") # 오류 유지
+            expected_shape = (MAX_SOURCE + MAX_DEST, pile_feature_dim)
+            return torch.zeros(expected_shape, dtype=torch.float).cpu()
         return state_tensor
 
+
     def export_final_state_to_excel(self, output_filepath):
+        """최종 파일 배치 상태를 Excel 파일로 저장합니다. (원본 파일 이름 사용)"""
         rows = []
-        for key, pile in self.plates.items():
+        all_normalized_keys = sorted(list(self.plates.keys())) # 정규화된 키
+
+        # 역매핑 정보 가져오기 (없으면 빈 dict)
+        norm_map = getattr(self, 'norm_to_orig_map', {})
+        if not norm_map: print("[Warning] export: 역매핑 정보 없음.") # 경고 유지
+
+        for normalized_key in all_normalized_keys:
+            pile = self.plates.get(normalized_key, [])
+            # 정규화된 키 -> 원본 파일 이름 변환
+            original_pile_name = norm_map.get(normalized_key, normalized_key) # fallback 포함
+
             for depth_idx, plate_obj in enumerate(pile):
-                row = {
-                    "pileno": plate_obj.id if hasattr(plate_obj, "id") else str(plate_obj),
-                    "inbound": plate_obj.inbound if hasattr(plate_obj, "inbound") else None,
-                    "outbound": plate_obj.outbound if hasattr(plate_obj, "outbound") else None,
-                    "unitw": plate_obj.unitw if hasattr(plate_obj, "unitw") else None,
-                    "final_pile": key,
-                    "depth": depth_idx,
-                    "topile": getattr(plate_obj, "topile", None)
-                }
-                rows.append(row)
+                if isinstance(plate_obj, Plate):
+                    # 저장된 원본 목표 파일 이름 가져오기
+                    original_intended_topile_name = getattr(plate_obj, 'original_intended_topile', None)
+                    row = {
+                        "pileno": getattr(plate_obj, 'id', f'Unknown_{original_pile_name}_{depth_idx}'),
+                        "inbound": getattr(plate_obj, 'inbound', None),
+                        "outbound": getattr(plate_obj, 'outbound', None),
+                        "unitw": getattr(plate_obj, 'unitw', None),
+                        "final_pile": original_pile_name, # 원본 이름 사용
+                        "depth": depth_idx,
+                        "original_topile": original_intended_topile_name # 원본 이름 사용
+                    }
+                    rows.append(row)
+                # else: print(f"[Warning] export: Non-Plate object in pile '{original_pile_name}'") # 필요시 활성화
+
+        if not rows:
+            print("[Warning] 내보낼 플레이트 정보 없음.") # 경고 유지
+            return
+
         df = pd.DataFrame(rows)
-        os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-        with pd.ExcelWriter(output_filepath, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="final_arrangement", index=False)
+        try:
+            output_dir = os.path.dirname(output_filepath)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                # print(f"[정보] 출력 디렉토리 생성: {output_dir}") # 정보 메시지 제거
+            with pd.ExcelWriter(output_filepath, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="final_arrangement", index=False)
+            # print(f"[정보] 최종 상태 저장 완료: {output_filepath}") # 정보 메시지 제거
+        except Exception as e:
+            print(f"[오류] 최종 상태 Excel 내보내기 오류: {e}") # 오류 메시지 유지
+
 
     def get_masks(self):
-        source_mask = torch.tensor(
-            [len(self.plates.get(key, [])) > 0 for key in self.from_keys],
-            dtype=torch.bool
-        )
-        dest_mask = torch.tensor(
-            [len(self.plates.get(key, [])) < self.max_stack for key in self.to_keys],
-            dtype=torch.bool
-        )
-        # print(f"[DEBUG] get_masks: source_mask = {source_mask}, dest_mask = {dest_mask}")
+        """현재 상태에서 유효한 출발/도착 파일 마스크를 생성합니다."""
+        source_flags = [False] * MAX_SOURCE
+        for i in range(min(len(self.from_keys), MAX_SOURCE)):
+            key = self.from_keys[i] # 정규화된 키
+            # .get() 결과가 truthy 인지 확인 (빈 리스트는 False)
+            if self.plates.get(key): source_flags[i] = True
+        source_mask = torch.tensor(source_flags, dtype=torch.bool)
+
+        dest_flags = [False] * MAX_DEST
+        for j in range(min(len(self.to_keys), MAX_DEST)):
+            key = self.to_keys[j] # 정규화된 키
+            # 파일 길이가 max_stack 미만이면 True
+            if len(self.plates.get(key, [])) < self.max_stack:
+                dest_flags[j] = True
+        dest_mask = torch.tensor(dest_flags, dtype=torch.bool)
 
         return source_mask, dest_mask

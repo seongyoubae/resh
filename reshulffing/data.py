@@ -113,7 +113,7 @@ def save_reshuffle_plan_to_excel(df_reshuffle, file_path):
 def main():
     cfg = get_cfg()
     # Excel 파일 저장 경로 지정 (원하는 폴더와 파일명)
-    output_file = "output/reshuffle_plan(for eval).xlsx"
+    output_file = "output/reshuffle_plan.xlsx"
 
     # 설정값을 이용해 reshuffle plan 생성
     rows = ['A', 'B']
@@ -121,7 +121,7 @@ def main():
         rows,
         n_from_piles_reshuffle=20,
         n_to_piles_reshuffle=20,
-        n_plates_reshuffle=22,
+        n_plates_reshuffle=20,
         safety_margin=0
     )
     print(f"Generated reshuffle plan with {df_plan.shape[0]} rows.")
