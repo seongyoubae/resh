@@ -82,14 +82,24 @@ class Locating(object):
                  device="cuda", # 현재 로직에서 사용 안 됨
                  crane_penalty=0.0):
 
+        cfg = get_cfg()
         self.max_stack = int(max_stack)
+        self.OBSERVED_TOP_N_PLATES = getattr(cfg, 'OBSERVED_TOP_N_PLATES', 30)
+        self.NUM_SUMMARY_STATS_DEEPER = getattr(cfg, 'NUM_SUMMARY_STATS_DEEPER', 4)
+        self.NUM_PILE_TYPE_FEATURES = 1
+        self.NUM_BLOCKING_FEATURES = 1
+
+        self.actual_pile_feature_dim = self.OBSERVED_TOP_N_PLATES + \
+                                       self.NUM_SUMMARY_STATS_DEEPER + \
+                                       self.NUM_PILE_TYPE_FEATURES + \
+                                       self.NUM_BLOCKING_FEATURES
+
         self.stage = 0 # 현재까지 이동한 횟수
         self.current_date = 0 # 사용되지 않음 (필요 시 로직 추가)
         self.crane_move = 0 # 크레인 이동 횟수 (단순 카운트)
         self.plates = {}    # 현재 파일 상태 (key: 정규화된 키, value: Plate 리스트)
         self.crane_penalty = float(crane_penalty)
 
-        cfg = get_cfg() # 설정 로드
         schedule_to_process = None # 원본 스케줄 리스트 (정규화 전)
 
         # === 1. 스케줄 준비 (외부 입력 > 파일 로드 > 기본 생성) ===
@@ -246,12 +256,33 @@ class Locating(object):
                 outbound_j = plate_j.outbound
 
                 # --- 핵심 로직: 블로킹 카운트 ---
-                # 아래 판(i)이 위 판(j)보다 나중에 나가야 할 경우(outbound_i > outbound_j)
-                if outbound_i > outbound_j:
+                # 아래 판(i)이 위 판(j)보다 나중에 나가야 할 경우(outbound_i < outbound_j)
+                if outbound_i < outbound_j:
                     move += 1
 
             max_move = max(max_move, move)
+
         return max_move
+
+    def _get_total_blocking_pairs(self, pile):
+        """주어진 파일 내 총 블로킹 쌍(pair) 개수 계산"""
+        n_pile = len(pile)
+        if n_pile <= 1: return 0
+        total_blocking_pairs = 0
+        for i in range(n_pile - 1): # 아래 판 인덱스 i
+            plate_i = pile[i]
+            if not (hasattr(plate_i, 'outbound') and isinstance(getattr(plate_i, 'outbound', None), (int, float))): continue
+            outbound_i = plate_i.outbound
+
+            for j in range(i + 1, n_pile): # 위 판 인덱스 j
+                plate_j = pile[j]
+                if not (hasattr(plate_j, 'outbound') and isinstance(getattr(plate_j, 'outbound', None), (int, float))): continue
+                outbound_j = plate_j.outbound
+
+                if outbound_i < outbound_j: # 블로킹 조건
+                    total_blocking_pairs += 1
+
+        return total_blocking_pairs
 
     def step(self, action):
         """환경 스텝 함수"""
@@ -266,7 +297,7 @@ class Locating(object):
         shaping_reward_scale = getattr(cfg, "shaping_reward_scale", 1.0)
 
         # 1. 행동 전 포텐셜 계산 (블로킹 지표 사용)
-        potential_before = -sum(self._get_max_move_for_pile(self.plates.get(key, [])) for key in self.to_keys)
+        potential_before = -sum(self._get_total_blocking_pairs(self.plates.get(key, [])) for key in self.to_keys)
 
         from_index, to_index = action
 
@@ -305,93 +336,142 @@ class Locating(object):
               print(f"[심각] Step {self.stage}: 비어있는 '{source_key}'에서 pop 시도!") # 오류 유지
               return self._get_state(), 0.0, True, {"error": "Pop from empty pile"}
 
-        # 5. 행동 후 포텐셜 계산
-        potential_after = -sum(self._get_max_move_for_pile(self.plates.get(key, [])) for key in self.to_keys)
+        # 5. 행동 후 포텐셜 계산 (총 블로킹 쌍 기준)
+        potential_after = -sum(self._get_total_blocking_pairs(self.plates.get(key, [])) for key in self.to_keys)
 
-        # 6. 형태 보상(Shaping Reward) 계산 및 스케일 적용
-        shaping_reward = gamma * potential_after - potential_before
-        shaping_reward *= shaping_reward_scale
-        total_reward = shaping_reward # 현재 보상은 이것만 사용
-
-        # 7. 상태 업데이트
-        self.move_data.append((source_key, destination_key)) # 이동 기록
+        # 6. 상태 업데이트
+        self.move_data.append((source_key, destination_key))
         self.crane_move += 1
         self.stage += 1
 
-        # 8. 종료 조건 확인
+        # 7. 종료 조건 확인
         done = self.stage >= self.total_plate_count
-        if self.total_plate_count <= 0: done = True
-
-        # 9. 다음 상태 가져오기
-        next_state = self._get_state()
-
-        # 10. 종료 시 정보(info) 설정 (최종 평가 지표 포함)
         info = {}
+        if self.total_plate_count <= 0: done = True # 예외 처리
+
+        # 8. 다음 상태 가져오기
+        next_state = self._get_state() # CPU Tensor
+
+        # --- 보상 계산 (PBRS + Terminal Reward) ---
+        shaping_reward = (cfg.gamma * potential_after - potential_before) * cfg.shaping_reward_scale
+        terminal_reward = 0.0
+
         if done:
-            total_max_move_final = sum(self._get_max_move_for_pile(self.plates.get(key, [])) for key in self.to_keys)
-            info['final_max_move_sum'] = total_max_move_final
+            # 최종 블로킹 지표 계산 (총 블로킹 쌍 기준)
+            final_blocking_metric = sum(self._get_total_blocking_pairs(self.plates.get(key, [])) for key in self.to_keys)
+            info['final_max_move_sum'] = final_blocking_metric
+            info['final_crane_move'] = self.crane_move
+
+            # 터미널 보상 계산
+            terminal_reward = 1.0 / (final_blocking_metric+1)
+
+        # 최종 보상 = PBRS + 터미널 보상(done일 때만)
+        total_reward = shaping_reward + terminal_reward
 
         return next_state, total_reward, done, info
 
     def _get_state(self):
-        """환경 상태를 모델 입력 텐서로 변환합니다."""
-        cfg = get_cfg()
-        current_max_stack = getattr(cfg, 'max_stack', self.max_stack)
-        pile_feature_dim = current_max_stack + 1
-        padding_feature = [0.0] * pile_feature_dim
+        padding_feature = [0.0] * self.actual_pile_feature_dim
         state_features = []
 
         # Source Piles 특징 추출
-        for i in range(MAX_SOURCE):
-            feature_vector = padding_feature[:] # 리스트 복사하여 사용
+        for i in range(MAX_SOURCE):  # network.py에서 import한 MAX_SOURCE 사용
+            feature_vector_list = list(padding_feature)
             if i < len(self.from_keys):
-                key = self.from_keys[i]; pile = self.plates.get(key, [])
+                key = self.from_keys[i]
+                pile = self.plates.get(key, [])
                 if pile:
                     n_pile = len(pile)
-                    # 상단 플레이트 outbound (리스트 컴프리헨션, 할당 표현식)
-                    top_outbounds = [
-                        float(ob) if isinstance(ob := getattr(p, 'outbound', 0.0), (int, float)) else 0.0
-                        for k in range(n_pile - 1, max(-1, n_pile - 1 - current_max_stack), -1)
-                        if (p := pile[k]) # Check if p exists (not strictly needed due to range but safer)
-                    ]
-                    padded_top_outbounds = top_outbounds + [0.0] * (current_max_stack - len(top_outbounds))
-                    # 평균 outbound (리스트 컴프리헨션, 할당 표현식)
-                    valid_outbounds = [float(val) for p in pile if isinstance((val := getattr(p, 'outbound', None)), (int, float))]
-                    avg_outbound = sum(valid_outbounds) / len(valid_outbounds) if valid_outbounds else 0.0
-                    feature_vector = padded_top_outbounds + [avg_outbound]
-            state_features.append(feature_vector)
+                    for feature_idx in range(self.OBSERVED_TOP_N_PLATES):
+                        plate_actual_idx_in_pile = n_pile - 1 - feature_idx
+                        if plate_actual_idx_in_pile >= 0:
+                            p_obj = pile[plate_actual_idx_in_pile]
+                            ob_val = getattr(p_obj, 'outbound', 0.0)
+                            feature_vector_list[feature_idx] = float(ob_val) if isinstance(ob_val,
+                                                                                           (int, float)) else 0.0
+                        else:
+                            feature_vector_list[feature_idx] = 0.0
 
-        # Destination Piles 특징 추출
-        for j in range(MAX_DEST):
-             feature_vector = padding_feature[:]
-             if j < len(self.to_keys):
-                key = self.to_keys[j]; pile = self.plates.get(key, [])
+                    deeper_plates_end_idx_exclusive = max(0, n_pile - self.OBSERVED_TOP_N_PLATES)
+                    deeper_plates = pile[0:deeper_plates_end_idx_exclusive]
+                    summary_stats_start_idx = self.OBSERVED_TOP_N_PLATES
+                    if deeper_plates:
+                        deeper_outbounds = []
+                        for p_deep in deeper_plates:
+                            ob_deep = getattr(p_deep, 'outbound', 0.0)
+                            if isinstance(ob_deep, (int, float)):
+                                deeper_outbounds.append(float(ob_deep))
+
+                        if deeper_outbounds:
+                            feature_vector_list[summary_stats_start_idx + 0] = float(len(deeper_plates))
+                            feature_vector_list[summary_stats_start_idx + 1] = min(deeper_outbounds)
+                            feature_vector_list[summary_stats_start_idx + 2] = max(deeper_outbounds)
+                            feature_vector_list[summary_stats_start_idx + 3] = sum(deeper_outbounds) / len(
+                                deeper_outbounds)
+                        elif self.NUM_SUMMARY_STATS_DEEPER > 0:  # count_deeper 만이라도 채움
+                            feature_vector_list[summary_stats_start_idx + 0] = float(len(deeper_plates))
+
+                    pile_type_idx = self.OBSERVED_TOP_N_PLATES + self.NUM_SUMMARY_STATS_DEEPER
+                    feature_vector_list[pile_type_idx] = 1.0
+                    blocking_count_idx = pile_type_idx + self.NUM_PILE_TYPE_FEATURES
+                    feature_vector_list[blocking_count_idx] = float(self._get_total_blocking_pairs(pile))
+            state_features.append(feature_vector_list)
+
+        # Destination Piles 특징 추출 (Source와 동일 로직)
+        for j in range(MAX_DEST):  # network.py에서 import한 MAX_DEST 사용
+            feature_vector_list = list(padding_feature)
+            if j < len(self.to_keys):
+                key = self.to_keys[j]
+                pile = self.plates.get(key, [])
                 if pile:
                     n_pile = len(pile)
-                    top_outbounds = [
-                        float(ob) if isinstance(ob := getattr(p, 'outbound', 0.0), (int, float)) else 0.0
-                        for k in range(n_pile - 1, max(-1, n_pile - 1 - current_max_stack), -1)
-                        if (p := pile[k])
-                    ]
-                    padded_top_outbounds = top_outbounds + [0.0] * (current_max_stack - len(top_outbounds))
-                    valid_outbounds = [float(val) for p in pile if isinstance((val := getattr(p, 'outbound', None)), (int, float))]
-                    avg_outbound = sum(valid_outbounds) / len(valid_outbounds) if valid_outbounds else 0.0
-                    feature_vector = padded_top_outbounds + [avg_outbound]
-             state_features.append(feature_vector)
+                    for feature_idx in range(self.OBSERVED_TOP_N_PLATES):
+                        plate_actual_idx_in_pile = n_pile - 1 - feature_idx
+                        if plate_actual_idx_in_pile >= 0:
+                            p_obj = pile[plate_actual_idx_in_pile]
+                            ob_val = getattr(p_obj, 'outbound', 0.0)
+                            feature_vector_list[feature_idx] = float(ob_val) if isinstance(ob_val,
+                                                                                           (int, float)) else 0.0
+                        else:
+                            feature_vector_list[feature_idx] = 0.0
 
-        # 최종 상태 텐서 생성 (오류 처리 포함)
+                    deeper_plates_end_idx_exclusive = max(0, n_pile - self.OBSERVED_TOP_N_PLATES)
+                    deeper_plates = pile[0:deeper_plates_end_idx_exclusive]
+                    summary_stats_start_idx = self.OBSERVED_TOP_N_PLATES
+                    if deeper_plates:
+                        deeper_outbounds = []
+                        for p_deep in deeper_plates:
+                            ob_deep = getattr(p_deep, 'outbound', 0.0)
+                            if isinstance(ob_deep, (int, float)):
+                                deeper_outbounds.append(float(ob_deep))
+
+                        if deeper_outbounds:
+                            feature_vector_list[summary_stats_start_idx + 0] = float(len(deeper_plates))
+                            feature_vector_list[summary_stats_start_idx + 1] = min(deeper_outbounds)
+                            feature_vector_list[summary_stats_start_idx + 2] = max(deeper_outbounds)
+                            feature_vector_list[summary_stats_start_idx + 3] = sum(deeper_outbounds) / len(
+                                deeper_outbounds)
+                        elif self.NUM_SUMMARY_STATS_DEEPER > 0:
+                            feature_vector_list[summary_stats_start_idx + 0] = float(len(deeper_plates))
+
+                    pile_type_idx = self.OBSERVED_TOP_N_PLATES + self.NUM_SUMMARY_STATS_DEEPER
+                    feature_vector_list[pile_type_idx] = 2.0
+                    blocking_count_idx = pile_type_idx + self.NUM_PILE_TYPE_FEATURES
+                    feature_vector_list[blocking_count_idx] = float(self._get_total_blocking_pairs(pile))
+            state_features.append(feature_vector_list)
+
         try:
-            state_tensor = torch.tensor(state_features, dtype=torch.float).cpu()
-            expected_shape = (MAX_SOURCE + MAX_DEST, pile_feature_dim)
+            state_tensor = torch.tensor(state_features, dtype=torch.float)
+            expected_shape = (MAX_SOURCE + MAX_DEST, self.actual_pile_feature_dim)
             if state_tensor.shape != expected_shape:
-                print(f"[Warning] _get_state: shape 불일치! {state_tensor.shape} vs {expected_shape}. Reshape.") # 경고 유지
-                state_tensor = state_tensor.reshape(expected_shape)
+                if state_tensor.shape[1] != self.actual_pile_feature_dim:
+                    print(
+                        f"[ERROR] _get_state: Feature dimension mismatch! Got {state_tensor.shape[1]}, expected {self.actual_pile_feature_dim}.")
         except Exception as e:
-            print(f"[오류] _get_state: 상태 텐서 생성 실패: {e}. 제로 텐서 반환.") # 오류 유지
-            expected_shape = (MAX_SOURCE + MAX_DEST, pile_feature_dim)
-            return torch.zeros(expected_shape, dtype=torch.float).cpu()
+            print(f"[ERROR] _get_state: Failed to create state tensor: {e}. Returning zeros.")
+            expected_shape = (MAX_SOURCE + MAX_DEST, self.actual_pile_feature_dim)
+            state_tensor = torch.zeros(expected_shape, dtype=torch.float)
         return state_tensor
-
 
     def export_final_state_to_excel(self, output_filepath):
         """최종 파일 배치 상태를 Excel 파일로 저장합니다. (원본 파일 이름 사용)"""

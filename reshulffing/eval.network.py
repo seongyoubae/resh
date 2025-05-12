@@ -19,7 +19,6 @@ except Exception as e:
 
 # --- env.py 임포트 ---
 try:
-    # !!! 중요: env.py 의 Locating 클래스 내부에 export_final_state_to_excel 메서드가 정의되어 있어야 합니다 !!!
     from env import Locating
     print("env.py 로드 성공.")
 except ImportError as e:
@@ -44,7 +43,6 @@ except Exception as e:
     generate_schedule = None
     exit()
 
-# === 헬퍼 함수 ===
 def set_seed(seed):
     """지정된 시드로 random, numpy, torch의 난수 생성기를 초기화합니다."""
     random.seed(seed)
@@ -187,8 +185,7 @@ def evaluate_policy(model, envs, device):
                  print(f"[경고] 환경 {idx}: 최대 스텝({max_steps}) 도달 종료.")
                  try:
                      current_plates_state = getattr(env, 'plates', {}); current_to_keys = getattr(env, 'to_keys', [])
-                     # env 에 _get_max_move_for_pile 메서드가 있어야 함
-                     final_metric_val = sum(env._get_max_move_for_pile(current_plates_state.get(key, [])) for key in current_to_keys)
+                     final_metric_val = sum(env._get_total_blocking_pairs(current_plates_state.get(key, [])) for key in current_to_keys)
                      print(f"          -> 최대 스텝 시점 계산된 max_move_sum = {final_metric_val}")
                  except Exception as e:
                      print(f"          -> 현재 상태 지표 계산 실패: {e}. 'inf'로 처리.")
@@ -238,7 +235,6 @@ if __name__ == "__main__":
                 num_critic_layers=cfg.num_critic_layers,
                 actor_init_std=cfg.actor_init_std,
                 critic_init_std=cfg.critic_init_std,
-                max_stack=cfg.max_stack,
                 num_from_piles=MAX_SOURCE,
                 num_to_piles=MAX_DEST,
                 num_heads=cfg.num_heads,
@@ -255,7 +251,7 @@ if __name__ == "__main__":
         exit()
 
     # --- 3. 체크포인트 불러오기 ---
-    checkpoint_path = "best_policy.pth" # <--- 평가할 체크포인트 파일
+    checkpoint_path = "best_policy_metric.pth" # <--- 평가할 체크포인트 파일
     print(f"체크포인트 로딩 시도 (직접 지정된 경로): {checkpoint_path}")
 
     if os.path.exists(checkpoint_path):

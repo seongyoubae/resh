@@ -118,7 +118,7 @@ def evaluate_policy(model, envs, device):
                  print(f"[Eval Warning] Env {idx}: Reached max steps ({max_steps}) without finishing.")
                  # 현재 상태 기준으로 계산 시도 (env에 해당 메서드 필요)
                  try:
-                     final_metric_val = sum(env._get_max_move_for_pile(env.plates.get(key, [])) for key in env.to_keys)
+                     final_metric_val = sum(env._get_total_blocking_pairs(env.plates.get(key, [])) for key in env.to_keys)
                      print(f"          Calculated max_move_sum at max steps: {final_metric_val}")
                  except Exception as e:
                      print(f"          Could not calculate max_move_sum at max steps: {e}")
