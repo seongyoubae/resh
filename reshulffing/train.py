@@ -86,7 +86,7 @@ def make_batch(data_buffer, device):
 def main():
     """메인 학습 함수"""
     set_seed(970517)
-    cfg = get_cfg() # 설정 로드 (Vessl 등 외부 덮어쓰기 포함)
+    cfg = get_cfg()
     device = torch.device(cfg.device)
     print(f"Using device: {device}")
     if device.type == "cuda":
@@ -118,7 +118,8 @@ def main():
     print(cfg_info)
     print("==========================================")
 
-    best_reward = float("-inf")
+    # --- 최고 성능 지표 추적 변수 초기화 (낮을수록 좋음) ---
+    best_metric = float("inf")
 
     # --- 초기 스케줄 생성 또는 로드 ---
     try:
@@ -148,23 +149,35 @@ def main():
             unique_to.add(p.topile)
         print(f"기본 생성된 스케줄: {len(schedule)}개 강판, {len(unique_from)}개 출발 파일, {len(unique_to)}개 목적 파일")
 
-    # --- 모델 생성 ---
+    _OBSERVED_TOP_N_PLATES = getattr(cfg, 'OBSERVED_TOP_N_PLATES', 30)
+    _NUM_SUMMARY_STATS_DEEPER = getattr(cfg, 'NUM_SUMMARY_STATS_DEEPER', 4)
+    _NUM_PILE_TYPE_FEATURES = 1
+    _NUM_BLOCKING_FEATURES = 1
+    actual_pile_feature_dim_for_model = _OBSERVED_TOP_N_PLATES + \
+                                        _NUM_SUMMARY_STATS_DEEPER + \
+                                        _NUM_PILE_TYPE_FEATURES + \
+                                        _NUM_BLOCKING_FEATURES
+
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
         num_actor_layers=cfg.num_actor_layers,
         num_critic_layers=cfg.num_critic_layers,
         actor_init_std=cfg.actor_init_std,
         critic_init_std=cfg.critic_init_std,
-        max_stack=cfg.max_stack,
-        num_from_piles=MAX_SOURCE,
-        num_to_piles=MAX_DEST,
-        num_heads=cfg.num_heads
+        pile_feature_dim=actual_pile_feature_dim_for_model,
+        num_heads=cfg.num_heads,
+        use_dropout_actor=getattr(cfg, 'use_dropout_actor', False),
+        use_dropout_critic=getattr(cfg, 'use_dropout_critic', False),
+        num_from_piles=MAX_SOURCE,  # network.py의 MAX_SOURCE와 일치
+        num_to_piles=MAX_DEST  # network.py의 MAX_DEST와 일치
     ).to(device)
+
     # train.py 에서 수정해야 할 부분 (기존 코드 예시)
     # actor_params = list(model.pile_encoder.parameters()) + \
     #                list(model.self_attention.parameters()) + \
     #                list(model.actor_head.parameters()) +    # list(model.dest_fc.parameters()) + [model.dest_embeddings]
     # Optimizer & LR Scheduler 설정
+
     actor_params = list(model.pile_encoder.parameters()) + \
                    list(model.attn_norm.parameters()) + \
                    list(model.self_attention.parameters()) + \
@@ -173,7 +186,10 @@ def main():
                    list(model.dest_attention.parameters()) + \
                    list(model.dest_fc.parameters()) + \
                    [model.dest_embeddings]
-    critic_params = list(model.critic_net.parameters())
+
+    critic_params = list(model.critic_attention.parameters()) + \
+                    list(model.critic_net.parameters()) + \
+                    [model.critic_query]
 
     actor_optimizer = optim.Adam(actor_params, lr=cfg.actor_lr)
     critic_optimizer = optim.Adam(critic_params, lr=cfg.critic_lr)
@@ -404,7 +420,6 @@ def main():
                     total_critic_loss += critic_loss.item() # 순수 크리틱 손실 누적
                     total_entropy_loss += entropy_loss.item()
 
-                    # 최종 PPO 손실 (역전파용 텐서, 모든 계수 적용)
                     ppo_loss = (cfg.P_coeff * actor_loss +
                                 cfg.V_coeff * critic_loss +
                                 entropy_loss)
@@ -518,23 +533,62 @@ def main():
                         "evaluation_reversal": eval_final_metric,
                     }, step=epoch)
 
-                if eval_reward > best_reward:
-                    best_reward = eval_reward
+                # 1. 최고 모델 저장 (Metric 기준, 값이 낮을수록 좋음)
+                if eval_final_metric < best_metric:
+                    best_metric = eval_final_metric
                     os.makedirs(cfg.save_model_dir, exist_ok=True)
-                    best_model_path = os.path.join(cfg.save_model_dir, "best_policy.pth")
+                    best_model_path = os.path.join(cfg.save_model_dir, "best_policy_metric.pth")
                     torch.save(model.state_dict(), best_model_path)
-                    print(f"[BEST] New best model saved to {best_model_path} (Reward: {eval_reward:.2f})")
+                    print(f"[BEST] New best model saved to {best_model_path} (Metric: {eval_final_metric:.2f})")
+
+                # 2. 목표 기반 조기 종료 확인 (Metric 기준)
+                target_metric_value = cfg.target_metric_value
+
+                if eval_final_metric <= target_metric_value:
+                    print(
+                        f"\n[Target Reached!] Evaluation metric {eval_final_metric:.3f} reached target {target_metric_value} at epoch {epoch}.")
+                    print("Stopping training.")
+                    try:
+                        target_reached_path = os.path.join(cfg.save_model_dir, f"target_reached_ep{epoch}.pth")
+                        torch.save(
+                            {'epoch': epoch, 'global_step': global_step, 'model_state_dict': model.state_dict(),
+                             'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+                             'critic_optimizer_state_dict': critic_optimizer.state_dict(),
+                             'best_metric': best_metric,
+                             'final_eval_metric': eval_final_metric},
+                            target_reached_path)
+                        print(f"Model saved upon reaching target: '{target_reached_path}'")
+                    except Exception as save_e:
+                        print(f"[ERROR] Failed to save target reached model: {save_e}")
+                    break
+                    # --- 메인 학습 루프(for epoch)를 중단 ---
 
         # LR 스케줄러 스텝
         actor_lr_sched.step()
         critic_lr_sched.step()
 
         # 주기적 모델 저장
-        if epoch > 0 and epoch % cfg.save_every == 0:
+        if epoch > 0 and (epoch + 1) % cfg.save_every == 0:
             os.makedirs(cfg.save_model_dir, exist_ok=True)
-            save_path = os.path.join(cfg.save_model_dir, f"model_epoch_{epoch}.pth")
-            torch.save(model.state_dict(), save_path)
-            print(f"모델 저장됨: {save_path}")
+            save_path = os.path.join(cfg.save_model_dir,
+                                     f"model_epoch_{epoch}.pth")
+
+            checkpoint = {
+                'epoch': epoch,
+                'global_step': global_step,
+                'model_state_dict': model.state_dict(),
+                'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+                'critic_optimizer_state_dict': critic_optimizer.state_dict(),
+                'loss_metric': avg_loss,
+                'best_metric_val': best_metric,
+            }
+            if actor_lr_sched:
+                checkpoint['actor_scheduler_state_dict'] = actor_lr_sched.state_dict()
+            if critic_lr_sched:
+                checkpoint['critic_scheduler_state_dict'] = critic_lr_sched.state_dict()
+
+            torch.save(checkpoint, save_path)
+            print(f"전체 체크포인트 저장됨: {save_path} (에폭 {epoch}, Global Step {global_step})")
 
     # 학습 종료 후 최종 모델 저장
     os.makedirs(cfg.save_model_dir, exist_ok=True)
