@@ -34,7 +34,7 @@ def get_cfg():
     parser.add_argument("--eval_every", type=int, default=50, help="Evaluate every x episodes")
     parser.add_argument("--save_every", type=int, default=200, help="Save model every x episodes")
     parser.add_argument("--save_final_state_every", type=int, default=10000, help="Save final state every x episodes")
-    parser.add_argument("--new_instance_every", type=int, default=500, help="Generate new scenarios every x episodes")
+    parser.add_argument("--new_instance_every", type=int, default=100, help="Generate new scenarios every x episodes")
     parser.add_argument("--value_clip_range", type=float, default=0.15, help="Value clipping range for critic update")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm for model parameters")
     parser.add_argument("--shaping_reward_scale", type=float, default=0.5, help="Potential Reward Scaling Factor")
