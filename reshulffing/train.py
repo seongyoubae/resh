@@ -487,60 +487,75 @@ def main():
 
         # --- 평가 ---
         if epoch % cfg.eval_every == 0 and epoch >= 0:
-            eval_schedule = None
             eval_excel_file = getattr(cfg, "evaluation_plates_data_path", None)
             if eval_excel_file and os.path.exists(eval_excel_file):
                 try:
+                    # 1. 평가용 Excel 파일 하나를 읽어옴
                     eval_df = pd.read_excel(eval_excel_file, sheet_name="reshuffle")
-                    eval_schedule = []
-                    for idx, row in eval_df.iterrows():
-                        plate_id = row["pileno"]
-                        inbound = row["inbound"] if ("inbound" in eval_df.columns and not pd.isna(row["inbound"])) else 0
-                        outbound = row["outbound"] if ("outbound" in eval_df.columns and not pd.isna(row["outbound"])) else 1
-                        unitw = row["unitw"] if ("unitw" in eval_df.columns and not pd.isna(row["unitw"])) else 1.0
-                        to_pile = str(row["topile"]).strip() if ("topile" in eval_df.columns and not pd.isna(row["topile"])) else "A01"
-                        p = Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
-                        p.from_pile = str(plate_id).strip()
-                        p.topile = to_pile
-                        eval_schedule.append(p)
-                    if not eval_schedule: raise ValueError("평가용 Excel 파일에서 로드한 스케줄이 비어 있습니다.")
-                    print("평가용 스케줄을 Excel 파일에서 불러왔습니다.")
+                    if eval_df.empty or 'scenario_id' not in eval_df.columns:
+                        raise ValueError("평가용 Excel 파일이 비어 있거나 'scenario_id' 컬럼이 없습니다.")
+
+                    # 2. 여러 환경 객체를 담을 빈 리스트를 생성
+                    eval_envs = []
+
+                    # 3. 'scenario_id'를 기준으로 데이터를 그룹화하여 각 시나리오를 개별적으로 처리
+                    for scenario_id, group_df in eval_df.groupby('scenario_id'):
+
+                        # 4. 각 그룹(하나의 시나리오)의 데이터로 스케줄 리스트를 만듬
+                        eval_schedule_for_one_env = []
+                        for idx, row in group_df.iterrows():
+                            plate_id = row["pileno"]
+                            inbound = row.get("inbound", 0)
+                            outbound = row.get("outbound", 1)
+                            unitw = row.get("unitw", 1.0)
+                            to_pile = str(row.get("topile", "A01")).strip()
+                            p = Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
+                            p.from_pile = str(plate_id).strip()
+                            p.topile = to_pile
+                            eval_schedule_for_one_env.append(p)
+
+                        # 5. 한 개의 시나리오로 한 개의 환경(env) 객체를 생성
+                        env = Locating(
+                            max_stack=cfg.max_stack,
+                            inbound_plates=copy.deepcopy(eval_schedule_for_one_env),
+                            device=device,
+                            crane_penalty=cfg.crane_penalty,
+                        )
+                        # 6. 생성된 환경을 큰 리스트에 추가
+                        eval_envs.append(env)
+
+                    print(f"총 {len(eval_envs)}개의 평가 환경을 생성하여 평가를 시작합니다.")
+
+                    # 7. '평가 환경 리스트' 전체를 evaluate_policy 함수에 전달
+                    eval_reward, eval_final_metric = evaluate_policy(model, eval_envs, device)
+
+                    # (이하 평가 결과 로깅 코드는 원래 코드와 동일하게 유지)
+                    print(f"--- Evaluation (Epoch {epoch}) ---")
+                    print(f"Avg Reward: {eval_reward:.2f}")
+                    print(f"Avg Final Metric (e.g., MaxMoveSum/Reversals): {eval_final_metric:.2f}")
+                    print("-------------------------------")
+
+                    tb_writer.add_scalar("Evaluation/AverageReward", eval_reward, epoch)
+                    tb_writer.add_scalar("Evaluation/AvgFinalMetric", eval_final_metric, epoch)
+                    if USE_VESSL:
+                        vessl.log({
+                            "evaluation_reward": eval_reward,
+                            "evaluation_reversal": eval_final_metric,
+                        }, step=epoch)
+
+                    # 최고 모델 저장 로직 (원래 코드와 동일)
+                    if eval_final_metric < best_metric:
+                        best_metric = eval_final_metric
+                        os.makedirs(cfg.save_model_dir, exist_ok=True)
+                        best_model_path = os.path.join(cfg.save_model_dir, "best_policy_metric.pth")
+                        torch.save(model.state_dict(), best_model_path)
+                        print(f"[BEST] New best model saved to {best_model_path} (Metric: {eval_final_metric:.2f})")
+
                 except Exception as e:
-                    print(f"평가용 Excel 파일 로드 오류 ({e}), 평가 건너<0xEB><0x84>.")
-                    eval_schedule = None
+                    print(f"평가 중 오류 발생: {e}")
+
             else:
-                print("평가용 Excel 파일이 없거나 경로가 설정되지 않았습니다. 평가 건너뜁니다.")
-                eval_schedule = None
-
-            if eval_schedule:
-                eval_env = Locating(
-                    max_stack=cfg.max_stack,
-                    inbound_plates=copy.deepcopy(eval_schedule),
-                    device=device,
-                    crane_penalty=cfg.crane_penalty,
-                )
-                eval_reward, eval_final_metric = evaluate_policy(model, [eval_env], device)
-                print(f"--- Evaluation (Epoch {epoch}) ---")
-                print(f"Avg Reward: {eval_reward:.2f}")
-                print(f"Avg Final Metric (e.g., MaxMoveSum/Reversals): {eval_final_metric:.2f}")
-                print("-------------------------------")
-
-                tb_writer.add_scalar("Evaluation/AverageReward", eval_reward, epoch)
-                tb_writer.add_scalar("Evaluation/AvgFinalMetric", eval_final_metric, epoch)
-                if USE_VESSL:
-                    vessl.log({
-                        "evaluation_reward": eval_reward,
-                        "evaluation_reversal": eval_final_metric,
-                    }, step=epoch)
-
-                # 1. 최고 모델 저장 (Metric 기준, 값이 낮을수록 좋음)
-                if eval_final_metric < best_metric:
-                    best_metric = eval_final_metric
-                    os.makedirs(cfg.save_model_dir, exist_ok=True)
-                    best_model_path = os.path.join(cfg.save_model_dir, "best_policy_metric.pth")
-                    torch.save(model.state_dict(), best_model_path)
-                    print(f"[BEST] New best model saved to {best_model_path} (Metric: {eval_final_metric:.2f})")
-
+                print("평가용 Excel 파일이 없거나 경로가 설정되지 않았습니다.")
                 # 2. 목표 기반 조기 종료 확인 (Metric 기준)
                 target_metric_value = cfg.target_metric_value
 
