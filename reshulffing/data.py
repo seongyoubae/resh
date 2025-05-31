@@ -119,9 +119,9 @@ def main():
     rows = ['A', 'B']
     df_plan, from_piles_reshuffle, mapping_from_pile_to_x, piles_all, x_max = generate_reshuffle_plan(
         rows,
-        n_from_piles_reshuffle=10,
+        n_from_piles_reshuffle=20,
         n_to_piles_reshuffle=20,
-        n_plates_reshuffle=20,
+        n_plates_reshuffle=22,
         safety_margin=0
     )
     print(f"Generated reshuffle plan with {df_plan.shape[0]} rows.")

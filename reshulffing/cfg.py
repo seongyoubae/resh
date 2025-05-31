@@ -23,9 +23,9 @@ def get_cfg():
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--lmbda", type=float, default=0.95, help="GAE parameter (lambda)")
     parser.add_argument("--eps_clip", type=float, default=0.15, help="Clipping parameter for PPO")
-    parser.add_argument("--T_horizon", type=int, default=200, help="Number of steps to collect per update, step in episode")
+    parser.add_argument("--T_horizon", type=int, default=440, help="Number of steps to collect per update, step in episode")
     parser.add_argument("--episodes_per_epoch", type=int, default=64, help="Number of episodes to collect per epoch, mini batch size")
-    parser.add_argument("--mini_batch_size", type=int, default=200, help="Fixed size of minibatches per PPO update, same with T_horizon")
+    parser.add_argument("--mini_batch_size", type=int, default=440, help="Fixed size of minibatches per PPO update, same with T_horizon")
     parser.add_argument("--K_epoch", type=int, default=3, help="Number of optimization epochs per update")
     parser.add_argument("--n_epoch", type=int, default=10000, help="Total number of epochs")
     parser.add_argument("--P_coeff", type=float, default=1.0, help="Coefficient for policy loss")
@@ -66,9 +66,9 @@ def get_cfg():
     parser.add_argument("--unitw_max", type=float, default=19.294, help="Maximum unit weight")
 
     # 재배치 계획 관련
-    parser.add_argument("--n_from_piles_reshuffle", type=int, default=10, help="Number of source piles for reshuffle")
+    parser.add_argument("--n_from_piles_reshuffle", type=int, default=20, help="Number of source piles for reshuffle")
     parser.add_argument("--n_to_piles_reshuffle", type=int, default=20, help="Number of destination piles for reshuffle")
-    parser.add_argument("--n_plates_reshuffle", type=int, default=20, help="Average number of plates to reshuffle per pile")
+    parser.add_argument("--n_plates_reshuffle", type=int, default=22, help="Average number of plates to reshuffle per pile")
     parser.add_argument("--safety_margin", type=int, default=0, help="Safety margin for reshuffle plan")
 
     # 네트워크 초기화 관련
