@@ -57,7 +57,7 @@ def get_cfg():
     parser.add_argument("--crane_penalty", type=float, default=0, help="Crane movement penalty")
 
     # 데이터 생성 관련
-    parser.add_argument("--num_plates", type=int, default=200, help="Number of plates for schedule generation")
+    parser.add_argument("--num_plates", type=int, default=440, help="Number of plates for schedule generation")
     parser.add_argument("--inbound_min", type=int, default=1, help="Minimum inbound value")
     parser.add_argument("--inbound_max", type=int, default=10, help="Maximum inbound value")
     parser.add_argument("--outbound_extra_min", type=int, default=1, help="Minimum extra for outbound relative to inbound")
