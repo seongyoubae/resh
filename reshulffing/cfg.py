@@ -24,7 +24,7 @@ def get_cfg():
     parser.add_argument("--lmbda", type=float, default=0.95, help="GAE parameter (lambda)")
     parser.add_argument("--eps_clip", type=float, default=0.15, help="Clipping parameter for PPO")
     parser.add_argument("--T_horizon", type=int, default=440, help="Number of steps to collect per update, step in episode")
-    parser.add_argument("--episodes_per_epoch", type=int, default=128, help="Number of episodes to collect per epoch, mini batch size")
+    parser.add_argument("--episodes_per_epoch", type=int, default=64, help="Number of episodes to collect per epoch, mini batch size")
     parser.add_argument("--mini_batch_size", type=int, default=440, help="Fixed size of minibatches per PPO update, same with T_horizon")
     parser.add_argument("--K_epoch", type=int, default=3, help="Number of optimization epochs per update")
     parser.add_argument("--n_epoch", type=int, default=10000, help="Total number of epochs")
