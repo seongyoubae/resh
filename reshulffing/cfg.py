@@ -8,11 +8,11 @@ def get_cfg():
     parser.add_argument("--n_episode", type=int, default=100000, help="Number of training episodes")
     parser.add_argument("--load_model", action="store_true", help="Whether to load a pre-trained model")
     parser.add_argument("--model_path", type=str, default="", help="Path to the pre-trained model file")
-    parser.add_argument("--embed_dim", type=int, default=512, help="Dimension of node embeddings")
+    parser.add_argument("--embed_dim", type=int, default=256, help="Dimension of node embeddings")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of multi-head attention heads")
     parser.add_argument("--num_HGT_layers", type=int, default=2, help="Number of HGT layers")
-    parser.add_argument("--num_actor_layers", type=int, default=3, help="Number of layers in the actor network")
-    parser.add_argument("--num_critic_layers", type=int, default=4, help="Number of layers in the critic network")
+    parser.add_argument("--num_actor_layers", type=int, default=2, help="Number of layers in the actor network")
+    parser.add_argument("--num_critic_layers", type=int, default=3, help="Number of layers in the critic network")
     parser.add_argument("--temp_lr", type=float, default=0.01, help="Learning rate for temperature parameter")
     parser.add_argument("--target_entropy", type=float, default=2.0, help="Target entropy for automatic temperature adjustment")
     parser.add_argument("--lr", type=float, default=0.0005, help="General learning rate (if not using separate actor/critic lr)")
@@ -66,9 +66,9 @@ def get_cfg():
     parser.add_argument("--unitw_max", type=float, default=19.294, help="Maximum unit weight")
 
     # 재배치 계획 관련
-    parser.add_argument("--n_from_piles_reshuffle", type=int, default=15, help="Number of source piles for reshuffle")
-    parser.add_argument("--n_to_piles_reshuffle", type=int, default=15, help="Number of destination piles for reshuffle")
-    parser.add_argument("--n_plates_reshuffle", type=int, default=22, help="Average number of plates to reshuffle per pile")
+    parser.add_argument("--n_from_piles_reshuffle", type=int, default=10, help="Number of source piles for reshuffle")
+    parser.add_argument("--n_to_piles_reshuffle", type=int, default=10, help="Number of destination piles for reshuffle")
+    parser.add_argument("--n_plates_reshuffle", type=int, default=20, help="Average number of plates to reshuffle per pile")
     parser.add_argument("--safety_margin", type=int, default=0, help="Safety margin for reshuffle plan")
 
     # 네트워크 초기화 관련
