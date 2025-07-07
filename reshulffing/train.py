@@ -8,10 +8,10 @@ import math
 import datetime
 import copy
 from cfg import get_cfg
-from env import Locating, normalize_keys  # 수정된 Locating 클래스
+from env import Locating, normalize_keys
 from data import Plate, generate_schedule, generate_reshuffle_plan, save_reshuffle_plan_to_excel
 from network import SteelPlateConditionalMLPModel, MAX_SOURCE, MAX_DEST
-from evaluation import evaluate_policy  # 평가 함수
+from evaluation import evaluate_policy
 
 # PyTorch 관련 임포트
 import torch.nn.functional as F
@@ -124,6 +124,10 @@ def main():
     print(cfg_info)
     print("==========================================")
 
+    # Log hyperparameters to Vessl if USE_VESSL is True
+    if USE_VESSL:
+        vessl.log(payload={"Hyperparameters": cfg_info}, step=0)
+
     best_metric = float("inf")
 
     try:
@@ -132,15 +136,15 @@ def main():
         for idx, row in df_plan.iterrows():
             plate_id = row["pileno"]
             inbound = row["inbound"] if (
-                    "inbound" in df_plan.columns and not pd.isna(row["inbound"])) else random.randint(
+                        "inbound" in df_plan.columns and not pd.isna(row["inbound"])) else random.randint(
                 cfg.inbound_min, cfg.inbound_max)
             outbound = row["outbound"] if (
-                    "outbound" in df_plan.columns and not pd.isna(row["outbound"])) else inbound + random.randint(
+                        "outbound" in df_plan.columns and not pd.isna(row["outbound"])) else inbound + random.randint(
                 cfg.outbound_extra_min, cfg.outbound_extra_max)
             unitw = row["unitw"] if ("unitw" in df_plan.columns and not pd.isna(row["unitw"])) else random.uniform(
                 cfg.unitw_min, cfg.unitw_max)
             to_pile = str(row["topile"]).strip() if (
-                    "topile" in df_plan.columns and not pd.isna(row["topile"])) else "A01"
+                        "topile" in df_plan.columns and not pd.isna(row["topile"])) else "A01"
             p = Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
             p.from_pile = str(plate_id).strip()
             p.topile = to_pile
@@ -269,20 +273,17 @@ def main():
                     actions, logprobs, value, _ = model.act_batch(state_tensor, source_mask, dest_mask, greedy=False,
                                                                   debug=False)
 
-                # [핵심 수정] action의 데이터 타입을 올바르게 처리합니다.
-                action_tensor = actions[0]  # 원본 텐서 유지
+                action_tensor = actions[0]
                 logprob_tensor = logprobs[0]
                 value_tensor = value[0]
 
-                # env.step에는 파이썬 기본 타입을 전달
                 src_idx = action_tensor[0].item()
                 dst_idx = action_tensor[1].item()
                 next_state, reward, done, info = env.step((src_idx, dst_idx))
 
-                # 데이터 버퍼에는 원본 텐서를 저장 (make_batch 호환)
                 transition = {
                     'state': state,
-                    'action': action_tensor,  # 텐서 저장
+                    'action': action_tensor,
                     'r': reward,
                     'next_state': next_state,
                     'logprob': logprob_tensor.item(),
@@ -319,12 +320,23 @@ def main():
 
         print(
             f"Epoch {epoch}: Avg Reward={avg_ep_reward:.2f}, Avg Final Max Move Sum={avg_final_max_move_sum:.2f}, Avg Crane={avg_crane_move:.2f}, Total Steps={total_steps}")
+
+        # Log training metrics to TensorBoard
         tb_writer.add_scalar("Training/AverageReward", avg_ep_reward, epoch)
         tb_writer.add_scalar("Training/AvgFinalMaxMoveSum", avg_final_max_move_sum, epoch)
         tb_writer.add_scalar("Training/AverageCraneMove", avg_crane_move, epoch)
 
-        # PPO 업데이트 루프는 보내주신 코드를 그대로 유지합니다.
-        # (단, `model.forward` 호출 부분은 이전에 수정한 대로 유지)
+        # Log training metrics to Vessl if USE_VESSL is True
+        if USE_VESSL:
+            vessl.log(
+                step=epoch,
+                payload={
+                    "Training/AverageReward": avg_ep_reward,
+                    "Training/AvgFinalMaxMoveSum": avg_final_max_move_sum,
+                    "Training/AverageCraneMove": avg_crane_move,
+                }
+            )
+
         if len(data_buffer) >= cfg.mini_batch_size:
             mini_data_buffer = data_buffer.copy()
             data_buffer.clear()
@@ -352,7 +364,7 @@ def main():
                     mini_adv = (mini_adv - mini_adv.mean()) / (mini_adv.std() + 1e-8)
 
                     with torch.no_grad():
-                        _, _, v_next, _ = model.forward(mini_s_prime)
+                        _, _, v_next, _ = model.forward(mini_s_prime)  # model.forward expects only state
 
                     td_target = mini_r + cfg.gamma * v_next * (1.0 - mini_done)
 
@@ -400,10 +412,24 @@ def main():
                 avg_entropy_loss = total_entropy_loss / num_updates
                 print(
                     f"Epoch {epoch}: Avg Loss={avg_loss:.4f} (Actor={avg_actor_loss:.4f}, Critic={avg_critic_loss:.4f}, Entropy={avg_entropy_loss:.4f})")
+
+                # Log loss metrics to TensorBoard
                 tb_writer.add_scalar("Loss/TotalLoss", avg_loss, epoch)
                 tb_writer.add_scalar("Loss/ActorLoss", avg_actor_loss, epoch)
                 tb_writer.add_scalar("Loss/CriticLoss", avg_critic_loss, epoch)
                 tb_writer.add_scalar("Loss/EntropyLoss", avg_entropy_loss, epoch)
+
+                # Log loss metrics to Vessl if USE_VESSL is True
+                if USE_VESSL:
+                    vessl.log(
+                        step=epoch,
+                        payload={
+                            "Loss/TotalLoss": avg_loss,
+                            "Loss/ActorLoss": avg_actor_loss,
+                            "Loss/CriticLoss": avg_critic_loss,
+                            "Loss/EntropyLoss": avg_entropy_loss,
+                        }
+                    )
 
         if epoch % cfg.eval_every == 0 and epoch >= 0:
             eval_excel_file = getattr(cfg, "evaluation_plates_data_path", None)
@@ -432,8 +458,19 @@ def main():
                     print(f"Avg Final Metric: {eval_final_metric:.2f}")
                     print("-------------------------------")
 
+                    # Log evaluation metrics to TensorBoard
                     tb_writer.add_scalar("Evaluation/AverageReward", eval_reward, epoch)
                     tb_writer.add_scalar("Evaluation/AvgFinalMetric", eval_final_metric, epoch)
+
+                    # Log evaluation metrics to Vessl if USE_VESSL is True
+                    if USE_VESSL:
+                        vessl.log(
+                            step=epoch,
+                            payload={
+                                "Evaluation/AverageReward": eval_reward,
+                                "Evaluation/AvgFinalMetric": eval_final_metric,
+                            }
+                        )
 
                     if eval_final_metric < best_metric:
                         best_metric = eval_final_metric
