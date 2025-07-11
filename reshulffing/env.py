@@ -458,12 +458,13 @@ class Locating(object):
 
         # [핵심 수정] 글로벌 특징을 0-1 사이로 정규화합니다.
         # MAX_SOURCE와 MAX_DEST가 0일 경우를 대비하여 나눗셈 오류 방지
-        normalized_num_sources = float(num_active_sources) / MAX_SOURCE if MAX_SOURCE > 0 else 0.0
-        normalized_num_dests = float(num_active_dests) / MAX_DEST if MAX_DEST > 0 else 0.0
+        #normalized_num_sources = float(num_active_sources) / MAX_SOURCE if MAX_SOURCE > 0 else 0.0
+        #normalized_num_dests = float(num_active_dests) / MAX_DEST if MAX_DEST > 0 else 0.0
 
+        # [핵심 수정] 글로벌 특징을 정규화하지 않고, 실제 개수(절대값)를 그대로 사용합니다.
         global_features = [
-            normalized_num_sources, # 정규화된 활성화 출발 파일 수
-            normalized_num_dests    # 정규화된 활성화 도착 파일 수
+            float(num_active_sources), # 활성화된 출발 파일의 실제 개수
+            float(num_active_dests)    # 활성화된 도착 파일의 실제 개수
         ]
 
         # 내부 헬퍼 함수 정의
