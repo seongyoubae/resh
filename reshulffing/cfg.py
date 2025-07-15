@@ -28,7 +28,7 @@ def get_cfg():
     parser.add_argument("--episodes_per_epoch", type=int, default=64, help="Number of episodes to collect per epoch, mini batch size")
     parser.add_argument("--mini_batch_size", type=int, default=300, help="Fixed size of minibatches per PPO update, same with T_horizon")
     parser.add_argument("--K_epoch", type=int, default=3, help="Number of optimization epochs per update")
-    parser.add_argument("--n_epoch", type=int, default=200, help="Total number of epochs")
+    parser.add_argument("--n_epoch", type=int, default=100, help="Total number of epochs")
     parser.add_argument("--P_coeff", type=float, default=1.0, help="Coefficient for policy loss")
     parser.add_argument("--V_coeff", type=float, default=0.5, help="Coefficient for value loss")
     parser.add_argument("--E_coeff", type=float, default=0.01, help="Coefficient for entropy loss")
