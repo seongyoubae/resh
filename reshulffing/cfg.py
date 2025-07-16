@@ -48,7 +48,7 @@ def get_cfg():
     parser.add_argument("--plates_data_path", type=str, default="output/reshuffle_plan.xlsx", help="Path to the plates data Excel file")
     parser.add_argument("--evaluation_plates_data_path", type=str, default="output/reshuffle_plan(for eval).xlsx", help="Path to the plates eval data Excel file")
     parser.add_argument("--log_file", type=str, default="training_log.csv", help="Path for training log CSV file")
-    parser.add_argument("--save_model_dir", type=str, default="output/saved_models", help="Directory to save models")
+    parser.add_argument("--save_model_dir", type=str, default="/output/saved_models", help="Directory to save models")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save output Excel files")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the model on (cuda or cpu)")
     parser.add_argument("--tensorboard_dir", type=str, default="./runs", help="Directory to save Tensorboard logs")
