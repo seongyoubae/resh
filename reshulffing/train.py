@@ -7,11 +7,12 @@ import pandas as pd
 import math
 import datetime
 import copy
+import warnings
 from cfg import get_cfg
-from env import Locating, normalize_keys
+from env import Locating  # 수정된 Locating 클래스
 from data import Plate, generate_schedule, generate_reshuffle_plan, save_reshuffle_plan_to_excel
 from network import SteelPlateConditionalMLPModel, MAX_SOURCE, MAX_DEST
-from evaluation import evaluate_policy
+from evaluation import evaluate_policy  # 평가 함수
 
 # PyTorch 관련 임포트
 import torch.nn.functional as F
@@ -27,6 +28,8 @@ try:
 except ImportError:
     USE_VESSL = False
     print("Vessl not installed. Skipping Vessl logging.")
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def set_seed(seed):
@@ -67,7 +70,8 @@ def make_batch(data_buffer, device):
         adv_lst.append([transition['advantage']])
         s_prime_lst.append(transition['next_state'])
         a_logprob_lst.append([transition['logprob']])
-        v_val = transition['v'].detach().cpu().item() if isinstance(transition['v'], torch.Tensor) else transition['v']
+        # v가 이미 스칼라 값으로 저장되어 있음
+        v_val = transition['v']
         v_lst.append([v_val])
         source_mask_lst.append(transition['source_mask'].unsqueeze(0))
         dest_mask_lst.append(transition['dest_mask'].unsqueeze(0))
@@ -81,11 +85,8 @@ def make_batch(data_buffer, device):
     adv = torch.tensor(adv_lst, dtype=torch.float, device=device)
     a_logprob = torch.tensor(a_logprob_lst, dtype=torch.float, device=device)
     v = torch.tensor(v_lst, dtype=torch.float, device=device)
-    source_mask_tensor = torch.cat(source_mask_lst, dim=0).to(device) if source_mask_lst else torch.empty(
-        (0, MAX_SOURCE), dtype=torch.bool, device=device)
-    dest_mask_tensor = torch.cat(dest_mask_lst, dim=0).to(device) if dest_mask_lst else torch.empty((0, MAX_DEST),
-                                                                                                    dtype=torch.bool,
-                                                                                                    device=device)
+    source_mask_tensor = torch.cat(source_mask_lst, dim=0).to(device)
+    dest_mask_tensor = torch.cat(dest_mask_lst, dim=0).to(device)
     done = torch.tensor(done_lst, dtype=torch.float, device=device)
 
     return s, a, r, adv, s_prime, a_logprob, v, source_mask_tensor, dest_mask_tensor, done
@@ -95,13 +96,14 @@ def main():
     """메인 학습 함수"""
     set_seed(970517)
     cfg = get_cfg()
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(cfg.device)
     print(f"Using device: {device}")
-    if str(device) == "cuda":
+    if device.type == "cuda":
         print(f" -> CUDA Device Count: {torch.cuda.device_count()}")
         print(f" -> Current CUDA Device: {torch.cuda.current_device()}")
         print(f" -> Device Name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
+    # TensorBoard 로그 디렉토리 설정
     base_tb_dir = getattr(cfg, "tensorboard_dir", "./runs")
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     tb_log_dir = os.path.join(base_tb_dir, timestamp)
@@ -109,6 +111,7 @@ def main():
     tb_writer = SummaryWriter(log_dir=tb_log_dir)
     print(f"TensorBoard log directory: {tb_log_dir}")
 
+    # 하이퍼파라미터 로깅
     cfg_info = (
         f"Learning Rate: {cfg.lr}\nActor LR: {cfg.actor_lr}\nCritic LR: {cfg.critic_lr}\n"
         f"LR Step: {cfg.lr_step}, LR Decay: {cfg.lr_decay}\n"
@@ -124,49 +127,18 @@ def main():
     print(cfg_info)
     print("==========================================")
 
-    # Log hyperparameters to Vessl if USE_VESSL is True
-    if USE_VESSL:
-        vessl.log(payload={"Hyperparameters": cfg_info}, step=0)
-
+    # --- 최고 성능 지표 추적 변수 초기화 (낮을수록 좋음) ---
     best_metric = float("inf")
 
-    try:
-        df_plan = pd.read_excel(cfg.plates_data_path, sheet_name="reshuffle")
-        schedule = []
-        for idx, row in df_plan.iterrows():
-            plate_id = row["pileno"]
-            inbound = row["inbound"] if (
-                        "inbound" in df_plan.columns and not pd.isna(row["inbound"])) else random.randint(
-                cfg.inbound_min, cfg.inbound_max)
-            outbound = row["outbound"] if (
-                        "outbound" in df_plan.columns and not pd.isna(row["outbound"])) else inbound + random.randint(
-                cfg.outbound_extra_min, cfg.outbound_extra_max)
-            unitw = row["unitw"] if ("unitw" in df_plan.columns and not pd.isna(row["unitw"])) else random.uniform(
-                cfg.unitw_min, cfg.unitw_max)
-            to_pile = str(row["topile"]).strip() if (
-                        "topile" in df_plan.columns and not pd.isna(row["topile"])) else "A01"
-            p = Plate(id=plate_id, inbound=inbound, outbound=outbound, unitw=unitw)
-            p.from_pile = str(plate_id).strip()
-            p.topile = to_pile
-            schedule.append(p)
-        if not schedule: raise ValueError("Excel에서 로드한 스케줄이 비어있습니다.")
-        print(f"초기 스케줄을 {cfg.plates_data_path} 에서 로드했습니다.")
-    except Exception as e:
-        print(f"Excel 로드 오류 ({e}), 기본 스케줄 생성")
-        schedule = generate_schedule(num_plates=cfg.num_plates)
-        for i, p in enumerate(schedule):
-            p.from_pile = f"Source_{i % MAX_SOURCE}"
-            p.topile = f"Dest_{i % MAX_DEST}"
-        print(f"기본 생성된 스케줄: {len(schedule)}개 강판")
-
-    print("Creating initial environment to determine model dimensions...")
-    initial_env = Locating(
-        max_stack=cfg.max_stack,
-        inbound_plates=copy.deepcopy(schedule),
-        device=device,
-        crane_penalty=cfg.crane_penalty
-    )
-    print(f"Pile feature dimension from env: {initial_env.actual_pile_feature_dim}")
+    # --- 모델 초기화 ---
+    _OBSERVED_TOP_N_PLATES = getattr(cfg, 'OBSERVED_TOP_N_PLATES', 10)
+    _NUM_SUMMARY_STATS_DEEPER = getattr(cfg, 'NUM_SUMMARY_STATS_DEEPER', 4)
+    _NUM_PILE_TYPE_FEATURES = 1
+    _NUM_BLOCKING_FEATURES = 1
+    actual_pile_feature_dim_for_model = (_OBSERVED_TOP_N_PLATES +
+                                         _NUM_SUMMARY_STATS_DEEPER +
+                                         _NUM_PILE_TYPE_FEATURES +
+                                         _NUM_BLOCKING_FEATURES)
 
     model = SteelPlateConditionalMLPModel(
         embed_dim=cfg.embed_dim,
@@ -174,7 +146,7 @@ def main():
         num_critic_layers=cfg.num_critic_layers,
         actor_init_std=cfg.actor_init_std,
         critic_init_std=cfg.critic_init_std,
-        pile_feature_dim=initial_env.actual_pile_feature_dim,
+        pile_feature_dim=actual_pile_feature_dim_for_model,
         num_heads=cfg.num_heads,
         use_dropout_actor=getattr(cfg, 'use_dropout_actor', False),
         use_dropout_critic=getattr(cfg, 'use_dropout_critic', False),
@@ -182,6 +154,7 @@ def main():
         num_to_piles=MAX_DEST
     ).to(device)
 
+    # --- 옵티마이저 및 LR 스케줄러 설정 ---
     actor_params = list(model.pile_encoder.parameters()) + \
                    list(model.attn_norm.parameters()) + \
                    list(model.self_attention.parameters()) + \
@@ -190,6 +163,7 @@ def main():
                    list(model.dest_attention.parameters()) + \
                    list(model.dest_fc.parameters()) + \
                    [model.dest_embeddings]
+
     critic_params = list(model.critic_attention.parameters()) + \
                     list(model.critic_net.parameters()) + \
                     [model.critic_query]
@@ -197,12 +171,13 @@ def main():
     actor_optimizer = optim.Adam(actor_params, lr=cfg.actor_lr, weight_decay=cfg.weight_decay)
     critic_optimizer = optim.Adam(critic_params, lr=cfg.critic_lr, weight_decay=cfg.weight_decay)
 
-    num_epochs_float = float(cfg.n_epoch)
-    lr_lambda = lambda epoch: max(0.0, 1.0 - (epoch / num_epochs_float))
+    num_epochs = float(cfg.n_epoch)
+    lr_lambda = lambda epoch: max(0.0, 1.0 - (epoch / num_epochs))
     actor_lr_sched = torch.optim.lr_scheduler.LambdaLR(actor_optimizer, lr_lambda=lr_lambda)
     critic_lr_sched = torch.optim.lr_scheduler.LambdaLR(critic_optimizer, lr_lambda=lr_lambda)
-    print(f"Using Linear LR Decay schedule over {int(num_epochs_float)} epochs.")
+    print(f"Using Linear LR Decay schedule over {int(num_epochs)} epochs.")
 
+    # --- CSV 로그 파일 설정 ---
     log_dir = os.path.dirname(cfg.log_file)
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
@@ -218,182 +193,207 @@ def main():
         print(f"Error opening log file {log_filename}: {e}")
         return
 
+    # --- 학습 루프 변수 초기화 ---
     data_buffer = []
     global_step = 0
+    start_epoch = 0  # 학습 재개를 위한 변수 (여기서는 0으로 시작)
 
-    for epoch in range(cfg.n_epoch):
-        current_schedule = schedule
-        if epoch > 0 and epoch % cfg.new_instance_every == 0:
-            print(f"새로운 시나리오 생성됨 (Epoch: {epoch})")
+    # --- 메인 학습 루프 (매 에피소드마다 새로운 시나리오 생성) ---
+    for epoch in range(start_epoch, cfg.n_epoch):
+        total_ep_reward = 0.0
+        total_steps_epoch = 0
+        ep_final_max_move_sums = []
+        ep_crane_moves = []
+        data_buffer.clear()  # 에포크 시작 시 데이터 버퍼를 비웁니다.
+
+        print(f"\n--- Epoch {epoch} (Data Collection) ---")
+
+        for ep_idx in range(cfg.episodes_per_epoch):
+            # --- START: 매 에피소드마다 시나리오 동적 생성 ---
+            # 50% 확률로 '저적재(low-pile)' 또는 '고적재(high-pile)' 문제 유형을 선택
+            if random.random() < 0.5:
+                # --- 시나리오 1: 저적재 (적은 파일, 적은 강판) ---
+                current_n_from = random.randint(5, 15)
+                current_n_to = random.randint(5, 15)
+                current_n_plates_per_active_pile = random.randint(3, 10)
+                scenario_type = "Low-pile"
+            else:
+                # --- 시나리오 2: 고적재 (많은 파일, 많은 강판) ---
+                current_n_from = random.randint(16, MAX_SOURCE)
+                current_n_to = random.randint(16, MAX_DEST)
+                current_n_plates_per_active_pile = random.randint(10, 20)
+                scenario_type = "High-pile"
+
+            schedule_for_current_episode = []
             try:
                 df_plan_new, _, _, _, _ = generate_reshuffle_plan(
                     rows=['A', 'B'],
-                    n_from_piles_reshuffle=cfg.n_from_piles_reshuffle,
-                    n_to_piles_reshuffle=cfg.n_to_piles_reshuffle,
-                    n_plates_reshuffle=cfg.n_plates_reshuffle,
+                    n_from_piles_reshuffle=current_n_from,
+                    n_to_piles_reshuffle=current_n_to,
+                    n_plates_reshuffle=current_n_plates_per_active_pile,
                     safety_margin=cfg.safety_margin
                 )
-                current_schedule = []
                 for idx, row in df_plan_new.iterrows():
-                    p = Plate(row["pileno"], row["inbound"], row["outbound"], row["unitw"])
-                    p.from_pile = row["pileno"]
-                    p.topile = row["topile"]
-                    current_schedule.append(p)
-            except Exception as e:
-                print(f"새 시나리오 생성 오류 ({e}), 이전 스케줄 사용")
+                    p = Plate(id=str(row["pileno"]),
+                              inbound=int(row["inbound"]),
+                              outbound=int(row["outbound"]),
+                              unitw=float(row["unitw"]))
+                    p.from_pile = str(row["pileno"])
+                    p.topile = str(row["topile"]).strip()
+                    schedule_for_current_episode.append(p)
+            except Exception as e_gen:
+                print(f"  [Error] Ep {ep_idx}: Failed to generate plan ({e_gen}). Skipping episode.")
+                continue
 
-        total_ep_reward = 0.0
-        total_steps = 0
-        ep_final_max_move_sums = []
-        ep_crane_moves = []
+            if not schedule_for_current_episode:
+                print(f"  [Warning] Ep {ep_idx}: Generated schedule is empty. Skipping episode.")
+                continue
 
-        for ep in range(cfg.episodes_per_epoch):
+            print(
+                f"  [Ep {ep_idx + 1}/{cfg.episodes_per_epoch}] Scenario: {scenario_type}, From: {current_n_from}, To: {current_n_to}, Plates: {len(schedule_for_current_episode)}")
+
+            # --- START: 환경 생성 및 에피소드 진행 ---
             env = Locating(
                 max_stack=cfg.max_stack,
-                inbound_plates=copy.deepcopy(current_schedule),
-                device=device,
+                inbound_plates=copy.deepcopy(schedule_for_current_episode),
                 crane_penalty=cfg.crane_penalty,
+                device=device
             )
-            state = env.reset(shuffle_schedule=False)
+            state = env.reset(shuffle_schedule=False).to(device)
             done = False
             ep_reward = 0.0
+            ep_steps = 0
             episode_transitions = []
             last_info = {}
-            t = 0
 
-            while not done and t < cfg.T_horizon:
-                s_mask, d_mask = env.get_masks()
-                source_mask = torch.zeros(1, MAX_SOURCE, dtype=torch.bool, device=device)
-                dest_mask = torch.zeros(1, MAX_DEST, dtype=torch.bool, device=device)
-                source_mask[0, :s_mask.size(0)] = s_mask
-                dest_mask[0, :d_mask.size(0)] = d_mask
+            t_step = 0
+            while not done and t_step < cfg.T_horizon:
+                s_mask_env, d_mask_env = env.get_masks()
+                source_mask_padded = torch.zeros(1, MAX_SOURCE, dtype=torch.bool, device=device)
+                dest_mask_padded = torch.zeros(1, MAX_DEST, dtype=torch.bool, device=device)
+
+                valid_source_len = min(s_mask_env.size(0), MAX_SOURCE)
+                valid_dest_len = min(d_mask_env.size(0), MAX_DEST)
+
+                source_mask_padded[0, :valid_source_len] = s_mask_env[:valid_source_len].clone().detach()
+                dest_mask_padded[0, :valid_dest_len] = d_mask_env[:valid_dest_len].clone().detach()
+
+                if not source_mask_padded.any() or not dest_mask_padded.any():
+                    # print(f"  [Debug] No valid source or destination. Ending episode.") # 디버깅용
+                    done = True  # 에피소드를 정상적으로 종료 처리합니다.
+                    break  # 현재 while 루프를 탈출합니다.
 
                 state_tensor = state.unsqueeze(0)
-                with torch.no_grad():
-                    actions, logprobs, value, _ = model.act_batch(state_tensor, source_mask, dest_mask, greedy=False,
-                                                                  debug=False)
+                actions, logprobs, value, _ = model.act_batch(state_tensor, source_mask_padded, dest_mask_padded,
+                                                              greedy=False)
 
-                action_tensor = actions[0]
-                logprob_tensor = logprobs[0]
-                value_tensor = value[0]
+                action = actions[0]
+                logprob = logprobs[0]
+                value_val = value[0].item()
+                src_idx_model = action[0].item()
+                dst_idx_model = action[1].item()
 
-                src_idx = action_tensor[0].item()
-                dst_idx = action_tensor[1].item()
-                next_state, reward, done, info = env.step((src_idx, dst_idx))
+                next_state_cpu, reward, done, info = env.step((src_idx_model, dst_idx_model))
+                next_state = next_state_cpu.to(device)
+                last_info = info
 
                 transition = {
-                    'state': state,
-                    'action': action_tensor,
-                    'r': reward,
-                    'next_state': next_state,
-                    'logprob': logprob_tensor.item(),
-                    'v': value_tensor,
-                    'source_mask': source_mask[0],
-                    'dest_mask': dest_mask[0],
-                    'done': done
+                    'state': state, 'action': action, 'r': reward, 'next_state': next_state,
+                    'logprob': logprob.item(), 'v': value_val,
+                    'source_mask': source_mask_padded[0], 'dest_mask': dest_mask_padded[0], 'done': done
                 }
                 episode_transitions.append(transition)
 
                 ep_reward += reward
+                ep_steps += 1
                 state = next_state
-                last_info = info
-                t += 1
-
-            total_ep_reward += ep_reward
-            total_steps += t
-            final_max_move = last_info.get('final_max_move_sum')
-            if final_max_move is not None:
-                ep_final_max_move_sums.append(final_max_move)
-            ep_crane_moves.append(env.crane_move)
+                t_step += 1
 
             if episode_transitions:
                 advantages = compute_gae(episode_transitions, cfg.gamma, cfg.lmbda)
                 for i, trans in enumerate(episode_transitions):
-                    trans['v'] = trans['v'].detach().cpu().item() if isinstance(trans['v'], torch.Tensor) else trans[
-                        'v']
                     trans['advantage'] = advantages[i]
                     data_buffer.append(trans)
 
-        avg_ep_reward = total_ep_reward / cfg.episodes_per_epoch
-        avg_final_max_move_sum = np.mean(ep_final_max_move_sums) if ep_final_max_move_sums else 0.0
+            total_ep_reward += ep_reward
+            total_steps_epoch += ep_steps
+            final_max_move = last_info.get('final_max_move_sum', float('inf'))
+            ep_final_max_move_sums.append(final_max_move)
+            ep_crane_moves.append(getattr(env, "crane_move", 0.0))
+            # --- END: 에피소드 진행 ---
+
+        # --- 에포크 결과 요약 및 로깅 ---
+        avg_ep_reward = total_ep_reward / cfg.episodes_per_epoch if cfg.episodes_per_epoch > 0 else 0
+        valid_max_moves = [m for m in ep_final_max_move_sums if m != float('inf')]
+        avg_final_max_move_sum = np.mean(valid_max_moves) if valid_max_moves else float('inf')
         avg_crane_move = np.mean(ep_crane_moves) if ep_crane_moves else 0.0
 
         print(
-            f"Epoch {epoch}: Avg Reward={avg_ep_reward:.2f}, Avg Final Max Move Sum={avg_final_max_move_sum:.2f}, Avg Crane={avg_crane_move:.2f}, Total Steps={total_steps}")
+            f"Epoch {epoch} Summary: Avg Reward={avg_ep_reward:.2f}, Avg Reversal={avg_final_max_move_sum:.2f}, Avg Crane={avg_crane_move:.2f}, Total Steps={total_steps_epoch}")
 
-        # Log training metrics to TensorBoard
         tb_writer.add_scalar("Training/AverageReward", avg_ep_reward, epoch)
         tb_writer.add_scalar("Training/AvgFinalMaxMoveSum", avg_final_max_move_sum, epoch)
         tb_writer.add_scalar("Training/AverageCraneMove", avg_crane_move, epoch)
-
-        # Log training metrics to Vessl if USE_VESSL is True
+        tb_writer.add_scalar("Training/TotalSteps", total_steps_epoch, epoch)
         if USE_VESSL:
-            vessl.log(
-                step=epoch,
-                payload={
-                    "Training/AverageReward": avg_ep_reward,
-                    "Training/AvgFinalMaxMoveSum": avg_final_max_move_sum,
-                    "Training/AverageCraneMove": avg_crane_move,
-                }
-            )
+            vessl.log({
+                "training_reward": avg_ep_reward,
+                "training_reversal": avg_final_max_move_sum,
+                "training_crane_move": avg_crane_move
+            }, step=epoch)
+
+        # --- PPO 업데이트 ---
+        avg_loss_val, avg_actor_loss_val, avg_critic_loss_val, avg_entropy_loss_val = 0.0, 0.0, 0.0, 0.0
 
         if len(data_buffer) >= cfg.mini_batch_size:
-            mini_data_buffer = data_buffer.copy()
-            data_buffer.clear()
-
-            total_loss, total_actor_loss, total_critic_loss, total_entropy_loss = 0.0, 0.0, 0.0, 0.0
+            total_loss_accum, total_actor_loss_accum, total_critic_loss_accum, total_entropy_loss_accum = 0.0, 0.0, 0.0, 0.0
             num_updates = 0
 
             for _ in range(cfg.K_epoch):
-                N = len(mini_data_buffer)
+                N = len(data_buffer)
                 indices = torch.randperm(N)
-                num_minibatches = N // cfg.mini_batch_size
+                for mb_start_idx in range(0, N, cfg.mini_batch_size):
+                    mb_end_idx = min(mb_start_idx + cfg.mini_batch_size, N)
+                    if mb_end_idx <= mb_start_idx: continue
 
-                for mb_i in range(num_minibatches):
-                    start = mb_i * cfg.mini_batch_size
-                    end = (mb_i + 1) * cfg.mini_batch_size
-                    if end > N: continue
-
-                    batch_idx = indices[start:end]
-                    mini_data = [mini_data_buffer[j] for j in batch_idx.tolist()]
+                    batch_indices = indices[mb_start_idx:mb_end_idx]
+                    mini_batch_data = [data_buffer[j] for j in batch_indices.tolist()]
 
                     mini_s, mini_a, mini_r, mini_adv, mini_s_prime, \
-                        mini_a_logprob, mini_v, mini_source_mask, mini_dest_mask, mini_done = make_batch(mini_data,
-                                                                                                         device)
+                        mini_a_logprob, mini_v_old, mini_source_mask, mini_dest_mask, mini_done = make_batch(
+                        mini_batch_data, device)
+
+                    if mini_s.nelement() == 0: continue
 
                     mini_adv = (mini_adv - mini_adv.mean()) / (mini_adv.std() + 1e-8)
 
                     with torch.no_grad():
-                        _, _, v_next, _ = model.forward(mini_s_prime)  # model.forward expects only state
+                        _, _, v_s_prime, _ = model.forward(mini_s_prime)
+                    td_target = mini_r + cfg.gamma * v_s_prime * (1.0 - mini_done)
 
-                    td_target = mini_r + cfg.gamma * v_next * (1.0 - mini_done)
+                    new_logprob, new_v, dist_entropy = model.evaluate(mini_s, mini_source_mask, mini_dest_mask, mini_a)
 
-                    new_a_logprob, new_v, dist_entropy = model.evaluate(
-                        mini_s, mini_source_mask, mini_dest_mask, mini_a
-                    )
-
-                    ratio = torch.exp(new_a_logprob - mini_a_logprob)
+                    ratio = torch.exp(new_logprob - mini_a_logprob)
                     surr1 = ratio * mini_adv
                     surr2 = torch.clamp(ratio, 1.0 - cfg.eps_clip, 1.0 + cfg.eps_clip) * mini_adv
                     actor_loss = -torch.min(surr1, surr2).mean()
 
-                    value_pred_clipped = mini_v + (new_v - mini_v).clamp(-cfg.value_clip_range, cfg.value_clip_range)
+                    value_pred_clipped = mini_v_old + (new_v - mini_v_old).clamp(-cfg.value_clip_range,
+                                                                                 cfg.value_clip_range)
                     beta = getattr(cfg, "smooth_l1_beta", 1.0)
-                    critic_loss_unclipped = F.smooth_l1_loss(new_v, td_target, reduction="none", beta=beta)
-                    critic_loss_clipped = F.smooth_l1_loss(value_pred_clipped, td_target, reduction="none", beta=beta)
+                    critic_loss_unclipped = F.smooth_l1_loss(new_v, td_target.detach(), reduction="none", beta=beta)
+                    critic_loss_clipped = F.smooth_l1_loss(value_pred_clipped, td_target.detach(), reduction="none",
+                                                           beta=beta)
                     critic_loss = torch.max(critic_loss_unclipped, critic_loss_clipped).mean()
 
                     entropy_loss = -cfg.E_coeff * dist_entropy.mean()
 
-                    total_actor_loss += actor_loss.item()
-                    total_critic_loss += critic_loss.item()
-                    total_entropy_loss += entropy_loss.item()
+                    total_actor_loss_accum += actor_loss.item()
+                    total_critic_loss_accum += critic_loss.item()
+                    total_entropy_loss_accum += entropy_loss.item()
 
-                    ppo_loss = (cfg.P_coeff * actor_loss +
-                                cfg.V_coeff * critic_loss +
-                                entropy_loss)
-
-                    total_loss += ppo_loss.item()
+                    ppo_loss = (cfg.P_coeff * actor_loss + cfg.V_coeff * critic_loss + entropy_loss)
+                    total_loss_accum += ppo_loss.item()
 
                     actor_optimizer.zero_grad()
                     critic_optimizer.zero_grad()
@@ -406,71 +406,81 @@ def main():
                     global_step += 1
 
             if num_updates > 0:
-                avg_loss = total_loss / num_updates
-                avg_actor_loss = total_actor_loss / num_updates
-                avg_critic_loss = total_critic_loss / num_updates
-                avg_entropy_loss = total_entropy_loss / num_updates
-                print(
-                    f"Epoch {epoch}: Avg Loss={avg_loss:.4f} (Actor={avg_actor_loss:.4f}, Critic={avg_critic_loss:.4f}, Entropy={avg_entropy_loss:.4f})")
+                avg_loss_val = total_loss_accum / num_updates
+                avg_actor_loss_val = total_actor_loss_accum / num_updates
+                avg_critic_loss_val = total_critic_loss_accum / num_updates
+                avg_entropy_loss_val = total_entropy_loss_accum / num_updates
 
-                # Log loss metrics to TensorBoard
-                tb_writer.add_scalar("Loss/TotalLoss", avg_loss, epoch)
-                tb_writer.add_scalar("Loss/ActorLoss", avg_actor_loss, epoch)
-                tb_writer.add_scalar("Loss/CriticLoss", avg_critic_loss, epoch)
-                tb_writer.add_scalar("Loss/EntropyLoss", avg_entropy_loss, epoch)
+            print(
+                f"  PPO Update: Avg Loss={avg_loss_val:.4f} (Actor={avg_actor_loss_val:.4f}, Critic={avg_critic_loss_val:.4f}, Entropy={avg_entropy_loss_val:.4f})")
 
-                # Log loss metrics to Vessl if USE_VESSL is True
-                if USE_VESSL:
-                    vessl.log(
-                        step=epoch,
-                        payload={
-                            "Loss/TotalLoss": avg_loss,
-                            "Loss/ActorLoss": avg_actor_loss,
-                            "Loss/CriticLoss": avg_critic_loss,
-                            "Loss/EntropyLoss": avg_entropy_loss,
-                        }
-                    )
+            tb_writer.add_scalar("Loss/TotalLoss", avg_loss_val, epoch)
+            tb_writer.add_scalar("Loss/ActorLoss", avg_actor_loss_val, epoch)
+            tb_writer.add_scalar("Loss/CriticLoss", avg_critic_loss_val, epoch)
+            tb_writer.add_scalar("Loss/EntropyLoss", avg_entropy_loss_val, epoch)
+            if USE_VESSL:
+                vessl.log({
+                    "total_loss": avg_loss_val, "actor_loss": avg_actor_loss_val,
+                    "critic_loss": avg_critic_loss_val, "entropy_loss": avg_entropy_loss_val
+                }, step=epoch)
 
+        else:
+            print(
+                f"  Skipping PPO update, data_buffer size ({len(data_buffer)}) < mini_batch_size ({cfg.mini_batch_size}).")
+
+        # --- CSV 파일에 에포크 결과 기록 ---
+        try:
+            with open(log_filename, mode="a", newline="") as f:
+                writer_csv = csv.writer(f)
+                loss_str = f"{avg_loss_val:.4f}" if num_updates > 0 else "N/A"
+                actor_loss_str = f"{avg_actor_loss_val:.4f}" if num_updates > 0 else "N/A"
+                critic_loss_str = f"{avg_critic_loss_val:.4f}" if num_updates > 0 else "N/A"
+                entropy_loss_str = f"{avg_entropy_loss_val:.4f}" if num_updates > 0 else "N/A"
+                writer_csv.writerow([
+                    epoch, cfg.episodes_per_epoch, f"{avg_ep_reward:.2f}",
+                    loss_str, actor_loss_str, critic_loss_str, entropy_loss_str,
+                    f"{avg_final_max_move_sum:.2f}", f"{avg_crane_move:.2f}", total_steps_epoch
+                ])
+        except IOError as e:
+            print(f"Error writing to log file {log_filename}: {e}")
+
+        # --- 평가 ---
         if epoch % cfg.eval_every == 0 and epoch >= 0:
             eval_excel_file = getattr(cfg, "evaluation_plates_data_path", None)
+            eval_final_metric = float('inf')
             if eval_excel_file and os.path.exists(eval_excel_file):
                 try:
                     eval_df = pd.read_excel(eval_excel_file, sheet_name="reshuffle")
                     if eval_df.empty or 'scenario_id' not in eval_df.columns:
                         raise ValueError("Evaluation Excel file is empty or missing 'scenario_id' column.")
+
                     eval_envs = []
                     for scenario_id, group_df in eval_df.groupby('scenario_id'):
                         eval_schedule_for_one_env = []
-                        for idx, row in group_df.iterrows():
-                            p = Plate(id=row["pileno"], inbound=row.get("inbound", 0), outbound=row.get("outbound", 1),
-                                      unitw=row.get("unitw", 1.0))
+                        for _, row in group_df.iterrows():
+                            p = Plate(id=row["pileno"], inbound=row.get("inbound", 0),
+                                      outbound=row.get("outbound", 1), unitw=row.get("unitw", 1.0))
                             p.from_pile = str(row["pileno"]).strip()
                             p.topile = str(row.get("topile", "A01")).strip()
                             eval_schedule_for_one_env.append(p)
-                        env = Locating(max_stack=cfg.max_stack, inbound_plates=copy.deepcopy(eval_schedule_for_one_env),
-                                       device=device, crane_penalty=cfg.crane_penalty)
-                        eval_envs.append(env)
 
-                    print(f"Created {len(eval_envs)} environments for evaluation.")
+                        env_eval = Locating(max_stack=cfg.max_stack,
+                                            inbound_plates=copy.deepcopy(eval_schedule_for_one_env),
+                                            device=device, crane_penalty=cfg.crane_penalty)
+                        eval_envs.append(env_eval)
+
+                    print(f"--- Evaluation (Epoch {epoch}) on {len(eval_envs)} scenarios ---")
                     eval_reward, eval_final_metric = evaluate_policy(model, eval_envs, device)
-                    print(f"--- Evaluation (Epoch {epoch}) ---")
-                    print(f"Avg Reward: {eval_reward:.2f}")
-                    print(f"Avg Final Metric: {eval_final_metric:.2f}")
-                    print("-------------------------------")
 
-                    # Log evaluation metrics to TensorBoard
+                    print(f"Avg Reward: {eval_reward:.2f}")
+                    print(f"Avg Final Metric (Reversals): {eval_final_metric:.2f}")
+                    print("---------------------------------")
+
                     tb_writer.add_scalar("Evaluation/AverageReward", eval_reward, epoch)
                     tb_writer.add_scalar("Evaluation/AvgFinalMetric", eval_final_metric, epoch)
-
-                    # Log evaluation metrics to Vessl if USE_VESSL is True
                     if USE_VESSL:
-                        vessl.log(
-                            step=epoch,
-                            payload={
-                                "Evaluation/AverageReward": eval_reward,
-                                "Evaluation/AvgFinalMetric": eval_final_metric,
-                            }
-                        )
+                        vessl.log({"evaluation_reward": eval_reward, "evaluation_reversal": eval_final_metric},
+                                  step=epoch)
 
                     if eval_final_metric < best_metric:
                         best_metric = eval_final_metric
@@ -480,29 +490,43 @@ def main():
                         print(f"[BEST] New best model saved to {best_model_path} (Metric: {eval_final_metric:.2f})")
 
                 except Exception as e:
-                    print(f"Error during evaluation: {e}")
+                    print(f"Evaluation error: {e}")
+            else:
+                print("Evaluation Excel file not found or path not set.")
 
+            # 목표 기반 조기 종료
+            target_metric_value = getattr(cfg, "target_metric_value", -float('inf'))
+            if eval_final_metric <= target_metric_value:
+                print(
+                    f"\n[Target Reached!] Metric {eval_final_metric:.3f} reached target {target_metric_value} at epoch {epoch}. Stopping.")
+                break
+
+        # --- LR 스케줄러 스텝 및 주기적 모델 저장 ---
         actor_lr_sched.step()
         critic_lr_sched.step()
 
         if epoch > 0 and (epoch + 1) % cfg.save_every == 0:
             os.makedirs(cfg.save_model_dir, exist_ok=True)
-            save_path = os.path.join(cfg.save_model_dir, f"model_epoch_{epoch + 1}.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+            save_path = os.path.join(cfg.save_model_dir, f"model_epoch_{epoch}.pth")
+            checkpoint_data = {
+                'epoch': epoch, 'global_step': global_step, 'model_state_dict': model.state_dict(),
                 'actor_optimizer_state_dict': actor_optimizer.state_dict(),
                 'critic_optimizer_state_dict': critic_optimizer.state_dict(),
-            }, save_path)
-            print(f"Checkpoint saved to {save_path}")
+                'loss_metric': float(avg_loss_val), 'best_metric_val': float(best_metric),
+                'actor_scheduler_state_dict': actor_lr_sched.state_dict(),
+                'critic_scheduler_state_dict': critic_lr_sched.state_dict()
+            }
+            torch.save(checkpoint_data, save_path)
+            print(f"Checkpoint saved: {save_path}")
 
-    final_model_path = os.path.join(cfg.save_model_dir, "final_policy.pth")
+    # --- 학습 종료 후 최종 모델 저장 ---
     os.makedirs(cfg.save_model_dir, exist_ok=True)
+    final_model_path = os.path.join(cfg.save_model_dir, f"final_policy_ep{cfg.n_epoch - 1}.pth")
     torch.save(model.state_dict(), final_model_path)
-    print(f"최종 모델 저장됨: {final_model_path}")
+    print(f"Final model saved: {final_model_path}")
 
     tb_writer.close()
-    print("학습 완료.")
+    print("Training session complete.")
 
 
 if __name__ == "__main__":
