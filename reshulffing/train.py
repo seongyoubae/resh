@@ -365,7 +365,9 @@ def main():
 
                     if mini_s.nelement() == 0: continue
 
-                    mini_adv = (mini_adv - mini_adv.mean()) / (mini_adv.std() + 1e-8)
+                    # 미니배치에 요소가 2개 이상일 때만 정규화를 수행하여 안정성 확보
+                    if mini_adv.numel() > 1:
+                        mini_adv = (mini_adv - mini_adv.mean()) / (mini_adv.std() + 1e-8)
 
                     with torch.no_grad():
                         _, _, v_s_prime, _ = model.forward(mini_s_prime)

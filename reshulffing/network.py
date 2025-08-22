@@ -279,31 +279,56 @@ class SteelPlateConditionalMLPModel(nn.Module):
         return actions, joint_logprob, value.squeeze(-1), actor_global_repr
 
     def evaluate(self, batch_pile_features, batch_source_mask, batch_dest_mask, batch_action):
-        B = batch_pile_features.size(0)
-        # forward 호출
+        """
+        PPO 업데이트 시 사용: 새로운 정책의 로그 확률, 상태 가치, 엔트로피를 계산합니다.
+        안정성을 위해 NaN 검사 및 '유효 행동 없음' 엣지 케이스 처리 로직을 포함합니다.
+        """
+        self.train()  # PPO 업데이트는 학습 과정이므로 train 모드로 설정
+
+        # 1. 모델 순전파: 로짓과 가치 예측
         source_logits, dest_logits, value, _ = self.forward(batch_pile_features)
 
-        # 마스크 적용 (masked_fill 값 변경)
-        if batch_source_mask is not None:
-            masked_source_logits = source_logits.masked_fill(~batch_source_mask, -float('inf'))
-        else: masked_source_logits = source_logits
-        if batch_dest_mask is not None:
-            masked_dest_logits = dest_logits.masked_fill(~batch_dest_mask, -float('inf'))
-        else: masked_dest_logits = dest_logits
+        # 2. NaN 값 명시적 검사 (근본 원인 진단)
+        # 모델 출력 자체에 NaN이 있다면, 이는 학습률 문제 등 심각한 수치적 불안정성이므로
+        # 안전장치로 넘어가기보다 즉시 에러를 발생시켜 원인을 수정하도록 유도합니다.
+        if torch.isnan(source_logits).any() or torch.isnan(dest_logits).any():
+            raise ValueError(
+                "NaN detected in model logits. This is a critical numerical instability issue. "
+                "Consider lowering the learning rate, checking reward scaling, or implementing gradient clipping."
+            )
 
-        # 분포 생성
+        # 3. 유효하지 않은 행동에 마스크 적용
+        masked_source_logits = source_logits.masked_fill(~batch_source_mask, -float('inf'))
+        masked_dest_logits = dest_logits.masked_fill(~batch_dest_mask, -float('inf'))
+
+        # 4. '유효 행동 없음' 엣지 케이스 처리 (안전장치)
+        # 마스크로 인해 모든 로짓이 -inf가 되면 Categorical 분포 생성 시 NaN이 발생합니다.
+        # 이 경우에만 해당하는 샘플을 찾아 안전하게 처리합니다.
+
+        # 소스 로짓 처리
+        all_source_invalid = torch.all(~batch_source_mask, dim=-1)
+        if torch.any(all_source_invalid):
+            # 문제가 되는 배치 샘플에 대해서만, 첫 번째 행동[0]에 0의 로짓을 부여합니다.
+            # 이렇게 하면 해당 행동의 확률이 1인 유효한 분포가 만들어져 크래시를 방지합니다.
+            # 이 조치는 학습에 거의 영향을 주지 않고 안정성만 높입니다.
+            masked_source_logits[all_source_invalid, 0] = 0.0
+
+        # 목적지 로짓 처리 (소스와 동일)
+        all_dest_invalid = torch.all(~batch_dest_mask, dim=-1)
+        if torch.any(all_dest_invalid):
+            masked_dest_logits[all_dest_invalid, 0] = 0.0
+
+        # 5. 확률 분포 생성 및 값 계산
         src_dist = torch.distributions.Categorical(logits=masked_source_logits)
         dst_dist = torch.distributions.Categorical(logits=masked_dest_logits)
 
-        # 배치 액션 분리
         chosen_source = batch_action[:, 0]
         chosen_dest = batch_action[:, 1]
 
-        # 로그 확률 및 엔트로피 계산
         src_logprob = src_dist.log_prob(chosen_source)
         dst_logprob = dst_dist.log_prob(chosen_dest)
         joint_logprob = src_logprob + dst_logprob
+
         joint_entropy = src_dist.entropy() + dst_dist.entropy()
 
-        # value는 (B, 1) 형태 유지, logprob, entropy도 (B,) -> (B,1) 로 차원 맞춤
         return joint_logprob.unsqueeze(-1), value, joint_entropy.unsqueeze(-1)
